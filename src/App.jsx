@@ -336,6 +336,7 @@ export default function MoneyBoard() {
       return d;
     });
     setEAmt(""); setEText("");
+    setEKind("expense"); // 수입 모드가 남아 다음 지출까지 수입으로 잡히는 걸 막는다
   };
 
   const addPlanned = () => {
@@ -483,7 +484,8 @@ export default function MoneyBoard() {
               </button>
             ))}
           </div>
-          <div className="flex flex-wrap gap-2 mt-2">
+          <div className="flex flex-wrap gap-2 mt-2 rounded"
+            style={eKind === "income" ? { background: "rgba(46,92,70,0.08)", padding: 8, margin: "8px -8px 0" } : undefined}>
             <input type="date" value={eDate} onChange={(e) => setEDate(e.target.value)}
               className="text-[11px] rounded px-1.5 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.sub }} />
             <input value={eAmt} onChange={(e) => setEAmt(e.target.value)} placeholder="금액(원)" inputMode="decimal"
@@ -511,8 +513,8 @@ export default function MoneyBoard() {
                 ))}
               </div>
             )}
-            <button onClick={addExpense} className="text-xs px-3 py-1.5 rounded text-white" style={{ background: eKind === "income" ? C.green : C.ink }}>
-              적기
+            <button onClick={addExpense} className="text-xs px-3 py-1.5 rounded text-white whitespace-nowrap" style={{ background: eKind === "income" ? C.green : C.ink }}>
+              {eKind === "income" ? "수입 적기" : "적기"}
             </button>
           </div>
           <div className="text-[10px] mt-2" style={{ color: C.sub }}>
