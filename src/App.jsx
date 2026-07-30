@@ -26,9 +26,11 @@ const ROLE_SRC = { spend: "week", save: "box" };
 const KEY = "minjun-money-v1";
 
 const SEED = {
-  v: 6,
+  v: 7,
   unit: "won",
   payday: 25,
+  cycleMode: "payday", // 생활비 입금 주기: weekly | payday
+  weekStart: 0, // 주 시작 요일: 0=일, 1=월
   autoBudget: true,
   budget: null, // 이번 주 확정된 자동 예산 { week, amount, weeks, days, balance }
   weeklyBudget: 100000, // 수동 모드에서 쓰는 값
@@ -60,10 +62,10 @@ const fromISO = (s) => {
   const [y, m, dd] = s.split("-").map(Number);
   return new Date(y, m - 1, dd);
 };
-/* 주는 일요일 시작 */
-const sundayOf = (d) => {
+/* 주 시작 요일: 0=일, 1=월 */
+const startOfWeek = (d, weekStart) => {
   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  x.setDate(x.getDate() - x.getDay());
+  x.setDate(x.getDate() - ((x.getDay() - weekStart + 7) % 7));
   return x;
 };
 const md = (d) => `${d.getMonth() + 1}/${d.getDate()}`;
@@ -86,13 +88,19 @@ const normalize = (p) => {
   // unit 플래그가 없으면 만원 단위 저장본 → 한 번만 ×10000 (플래그가 중복 변환을 막는다)
   const cv = (v) => Math.round((Number(v) || 0) * (p.unit === "won" ? 1 : 10000));
   return {
-    v: 6,
+    v: 7,
     unit: "won",
     payday: Number.isFinite(p.payday) ? p.payday : SEED.payday,
+    cycleMode: p.cycleMode === "weekly" ? "weekly" : "payday",
+    weekStart: p.weekStart === 1 ? 1 : 0,
     autoBudget: typeof p.autoBudget === "boolean" ? p.autoBudget : true,
     budget:
       p.budget && typeof p.budget.week === "string"
-        ? { week: p.budget.week, amount: cv(p.budget.amount), balance: cv(p.budget.balance), weeks: Number(p.budget.weeks) || 1, days: Number(p.budget.days) || 7 }
+        ? {
+            week: p.budget.week, amount: cv(p.budget.amount), balance: cv(p.budget.balance),
+            weeks: Number(p.budget.weeks) || 1, days: Number(p.budget.days) || 7,
+            until: typeof p.budget.until === "string" ? p.budget.until : null,
+          }
         : null,
     weeklyBudget: Number.isFinite(p.weeklyBudget) ? cv(p.weeklyBudget) : SEED.weeklyBudget,
     accounts: Array.isArray(p.accounts)
@@ -148,14 +156,25 @@ const balanceOf = (d, a) => {
   return Math.round(v);
 };
 
-/* 자동 예산 근거: 오늘부터 월말까지 남은 주수로 쓸돈 잔액을 나눈다 */
-const budgetBasis = (spendBal) => {
+/* 자동 예산 근거: 다음 생활비 입금일 전날까지를 남은 주수로 나눈다 */
+const budgetBasis = (d, spendBal) => {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const nextMonth = new Date(today.getFullYear(), today.getMonth() + 1, 1);
-  const days = Math.max(1, Math.round((nextMonth - today) / 86400000)); // 오늘 포함 월말까지
-  const weeks = Math.max(1, Math.ceil(days / 7));
-  return { weeks, days, balance: spendBal, amount: Math.max(0, Math.floor(spendBal / weeks / 1000) * 1000) };
+  const weekly = d.cycleMode === "weekly";
+  let end; // 다음 입금일 — 이 날 전날까지가 커버 기간
+  if (weekly) {
+    end = startOfWeek(today, d.weekStart);
+    end.setDate(end.getDate() + 7);
+  } else {
+    end = new Date(today.getFullYear(), today.getMonth(), d.payday);
+    if (today.getDate() >= d.payday) end.setMonth(end.getMonth() + 1);
+  }
+  const days = Math.max(1, Math.round((end - today) / 86400000));
+  const weeks = weekly ? 1 : Math.max(1, Math.ceil(days / 7));
+  // 매주 받으면 이번 주에 쓸 돈이 곧 잔액 전액, 급여일 주기면 남은 주수로 쪼개 천원 단위 내림
+  const amount = weekly ? Math.max(0, Math.round(spendBal)) : Math.max(0, Math.floor(spendBal / weeks / 1000) * 1000);
+  const last = new Date(end); last.setDate(last.getDate() - 1);
+  return { weeks, days, balance: spendBal, amount, until: toISO(last) };
 };
 
 /* ── 소형 컴포넌트 ─────────────────────────────────── */
@@ -206,6 +225,20 @@ function Card({ title, right, children }) {
       )}
       {children}
     </section>
+  );
+}
+
+/* 작은 선택 토글 */
+function Seg({ options, value, onChange }) {
+  return (
+    <div className="flex rounded overflow-hidden shrink-0" style={{ border: `1px solid ${C.line}` }}>
+      {options.map(([k, label]) => (
+        <button key={String(k)} onClick={() => onChange(k)} className="text-[10px] px-2 py-0.5"
+          style={{ background: value === k ? C.green : "#fff", color: value === k ? "#fff" : C.sub }}>
+          {label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -277,12 +310,12 @@ export default function MoneyBoard() {
   /* 주가 바뀌면(또는 아직 산정 전이면) 그 주의 예산을 한 번 확정하고, 주중에는 건드리지 않는다 */
   useEffect(() => {
     if (!loaded.current || !data || !data.autoBudget) return;
-    const wk = toISO(sundayOf(new Date()));
+    const wk = toISO(startOfWeek(new Date(), data.weekStart));
     if (data.budget && data.budget.week === wk) return;
     setData((prev) => {
       const d = structuredClone(prev);
       const spend = d.accounts.find((a) => a.role === "spend");
-      d.budget = { week: wk, ...budgetBasis(spend ? balanceOf(d, spend) : 0) };
+      d.budget = { week: wk, ...budgetBasis(d, spend ? balanceOf(d, spend) : 0) };
       return d;
     });
   }, [data]);
@@ -296,13 +329,14 @@ export default function MoneyBoard() {
 
   /* 파생값 */
   const todayISO = toISO(new Date());
-  const thisWeekKey = toISO(sundayOf(new Date()));
-  const inThisWeek = (iso) => toISO(sundayOf(fromISO(iso))) === thisWeekKey;
+  const sow = (d) => startOfWeek(d, data.weekStart);
+  const thisWeekKey = toISO(sow(new Date()));
+  const inThisWeek = (iso) => toISO(sow(fromISO(iso))) === thisWeekKey;
 
   const budget = data.autoBudget ? data.budget?.amount ?? 0 : data.weeklyBudget;
   const weekSpent = data.expenses.filter((e) => e.src === "week" && inThisWeek(e.date)).reduce((s, e) => s + e.amount, 0);
   const remaining = Math.round(budget - weekSpent);
-  const daysLeftWeek = 7 - new Date().getDay();
+  const daysLeftWeek = 7 - ((new Date().getDay() - data.weekStart + 7) % 7);
   const perDay = Math.max(remaining, 0) / daysLeftWeek;
   const todaySpent = data.expenses.filter((e) => e.date === todayISO && isExpense(e)).reduce((s, e) => s + e.amount, 0);
 
@@ -394,7 +428,7 @@ export default function MoneyBoard() {
       if (d.autoBudget) {
         // 쓸돈이 늘었으니 이번 주 예산을 바로 다시 확정한다
         const acc = d.accounts.find((a) => a.id === to.id);
-        d.budget = { week: toISO(sundayOf(new Date())), ...budgetBasis(balanceOf(d, acc)) };
+        d.budget = { week: toISO(startOfWeek(new Date(), d.weekStart)), ...budgetBasis(d, balanceOf(d, acc)) };
       }
       return d;
     });
@@ -449,7 +483,7 @@ export default function MoneyBoard() {
   /* 가계부 그룹핑: 주 → 일 */
   const byWeek = {};
   for (const e of data.expenses) {
-    const wk = toISO(sundayOf(fromISO(e.date)));
+    const wk = toISO(sow(fromISO(e.date)));
     (byWeek[wk] ??= []).push(e);
   }
   const weekKeys = Object.keys(byWeek).sort().reverse().slice(0, 6);
@@ -503,17 +537,13 @@ export default function MoneyBoard() {
 
         {/* 이번 주 — 통제의 중심 */}
         <Card
-          title="이번 주 (일요일 시작)"
+          title={`이번 주 (${data.weekStart === 1 ? "월요일" : "일요일"} 시작)`}
           right={
-            <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
-              {[[true, "자동"], [false, "수동"]].map(([k, label]) => (
-                <button key={label} onClick={() => up((d) => { d.autoBudget = k; if (k) d.budget = null; return d; })}
-                  className="text-[10px] px-2 py-0.5"
-                  style={{ background: data.autoBudget === k ? C.green : "#fff", color: data.autoBudget === k ? "#fff" : C.sub }}>
-                  {label}
-                </button>
-              ))}
-            </div>
+            <Seg
+              options={[[true, "자동"], [false, "수동"]]}
+              value={data.autoBudget}
+              onChange={(k) => up((d) => { d.autoBudget = k; if (k) d.budget = null; return d; })}
+            />
           }
         >
           <div className="flex items-baseline justify-between">
@@ -541,8 +571,29 @@ export default function MoneyBoard() {
               <Amount value={data.weeklyBudget} onCommit={(n) => up((d) => { d.weeklyBudget = n; return d; })} />
             )}
             {data.autoBudget && data.budget && (
-              <span className="font-mono tabular-nums">· {fmt(data.budget.balance)} ÷ {data.budget.weeks}주</span>
+              <span className="font-mono tabular-nums">
+                · {fmt(data.budget.balance)} ÷ {data.budget.weeks}주
+                {data.budget.until && ` (${md(fromISO(data.budget.until))}까지)`}
+              </span>
             )}
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 mt-2 text-[10px]" style={{ color: C.sub }}>
+            <span className="flex items-center gap-1">
+              입금 주기
+              <Seg
+                options={[["payday", "급여일마다"], ["weekly", "매주"]]}
+                value={data.cycleMode}
+                onChange={(k) => up((d) => { d.cycleMode = k; d.budget = null; return d; })}
+              />
+            </span>
+            <span className="flex items-center gap-1">
+              주 시작
+              <Seg
+                options={[[0, "일"], [1, "월"]]}
+                value={data.weekStart}
+                onChange={(k) => up((d) => { d.weekStart = k; d.budget = null; return d; })}
+              />
+            </span>
           </div>
           <div className="h-1 rounded-full mt-3 overflow-hidden" style={{ background: C.line }}>
             <div
