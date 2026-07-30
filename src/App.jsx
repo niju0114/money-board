@@ -25,6 +25,13 @@ const ROLE_SRC = { spend: "week", save: "box" };
 
 const KEY = "minjun-money-v1";
 
+/* 목표 시점 기본값 — 지금부터 12개월 뒤 */
+const defaultGoal = () => {
+  const t = new Date();
+  t.setMonth(t.getMonth() + 12);
+  return { monthly: 0, targetY: t.getFullYear(), targetM: t.getMonth() + 1 };
+};
+
 const SEED = {
   v: 4,
   payday: 25,
@@ -36,12 +43,8 @@ const SEED = {
     { id: "a4", name: "투자 계좌", note: "원금 기록 — 자주 안 보기", baseAmount: 0, baseTs: 0, role: "invest" },
   ],
   expenses: [],
-  roadmap: [
-    { id: "r1", when: "1개월", text: "시스템 가동 — 계좌 역할 정리, 주간 예산 시작", done: false },
-    { id: "r2", when: "3개월", text: "자동이체 안착 — 손대지 않아도 돌아가는지 점검", done: false },
-    { id: "r3", when: "6개월", text: "예산·저축 비율 중간 점검", done: false },
-    { id: "r4", when: "1년", text: "연 결산 — 다음 해 구조 새로 설계", done: false },
-  ],
+  planned: [],
+  goal: defaultGoal(),
   routine:
     "월급일: 수입 입금 확인\n다음날: 투자 계좌 자동이체\n매주 월요일: 생활비 통장으로 주간 예산 이체\n점검은 월 1회, 10분",
 };
@@ -112,20 +115,28 @@ const normalize = (p) => {
       // ts 없는 구버전 기록은 날짜로 보정하되, 마이그레이션 시각보다는 반드시 앞에 둔다
       ts: Number.isFinite(e.ts) ? e.ts : Math.min(fromISO(e.date).getTime(), now - 1),
     })),
-    // 구버전 백업에 todos가 있어도 조용히 버린다
-    roadmap: Array.isArray(p.roadmap) ? p.roadmap : structuredClone(SEED.roadmap),
+    // 구버전 백업의 todos·roadmap은 조용히 버린다
+    planned: Array.isArray(p.planned)
+      ? p.planned.map((x) => ({ id: x.id ?? uid(), date: x.date ?? toISO(new Date()), amount: Number(x.amount) || 0, memo: x.memo ?? "" }))
+      : [],
+    goal: {
+      monthly: Number.isFinite(p.goal?.monthly) ? p.goal.monthly : 0,
+      targetY: Number.isFinite(p.goal?.targetY) ? p.goal.targetY : defaultGoal().targetY,
+      targetM: Number.isFinite(p.goal?.targetM) ? p.goal.targetM : defaultGoal().targetM,
+    },
     routine: typeof p.routine === "string" ? p.routine : SEED.routine,
   };
 };
 
-/* 표시 잔액 = 기준값 − 기준시각 이후의 해당 역할 지출 */
+/* 표시 잔액 = 기준값 − 기준시각 이후의 해당 역할 지출 + 그 계좌로 들어온 수입 */
 const balanceOf = (d, a) => {
   const src = ROLE_SRC[a.role];
   let v = a.baseAmount;
-  if (src) {
-    for (const e of d.expenses) {
-      if (e.src === src && e.ts > a.baseTs) v -= e.amount;
-    }
+  for (const e of d.expenses) {
+    if (e.ts <= a.baseTs) continue;
+    if (e.kind === "income") {
+      if (e.acct === a.id) v += e.amount;
+    } else if (src && e.src === src) v -= e.amount;
   }
   return Math.round(v * 100) / 100;
 };
@@ -197,7 +208,6 @@ function EditToggle({ on, onClick }) {
 export default function MoneyBoard() {
   const [data, setData] = useState(null);
   const [editAcc, setEditAcc] = useState(false);
-  const [editRoad, setEditRoad] = useState(false);
   const [saveState, setSaveState] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
   const [showBackup, setShowBackup] = useState(false);
@@ -210,6 +220,11 @@ export default function MoneyBoard() {
   const [expEdit, setExpEdit] = useState(null); // { id, date, amt, text, src }
   const [editPay, setEditPay] = useState(false);
   const [payInput, setPayInput] = useState("");
+  const [eKind, setEKind] = useState("expense"); // expense | income
+  const [eAcct, setEAcct] = useState("");
+  const [pDate, setPDate] = useState(toISO(new Date()));
+  const [pAmt, setPAmt] = useState("");
+  const [pMemo, setPMemo] = useState("");
   const loaded = useRef(false);
   const timer = useRef(null);
 
@@ -256,7 +271,7 @@ export default function MoneyBoard() {
   const remaining = Math.round((data.weeklyBudget - weekSpent) * 100) / 100;
   const daysLeftWeek = 7 - ((new Date().getDay() + 6) % 7);
   const perDay = Math.max(remaining, 0) / daysLeftWeek;
-  const todaySpent = data.expenses.filter((e) => e.date === todayISO).reduce((s, e) => s + e.amount, 0);
+  const todaySpent = data.expenses.filter((e) => e.date === todayISO && e.kind !== "income").reduce((s, e) => s + e.amount, 0);
 
   const bal = (a) => balanceOf(data, a);
   const boxTotal = data.accounts.filter((a) => a.role === "save").reduce((s, a) => s + bal(a), 0);
@@ -289,6 +304,23 @@ export default function MoneyBoard() {
   const pay = paydayInfo(data.payday);
   const over = remaining < 0;
 
+  /* 모이는 돈 — 투자 잔액 + 월 적립 × 남은 개월 + 예정 수입 */
+  const curY = nowD.getFullYear(), curM = nowD.getMonth();
+  const monthsLeft = Math.max(0, (data.goal.targetY - curY) * 12 + (data.goal.targetM - 1 - curM));
+  const monthEndISO = (y, m) => toISO(new Date(y, m + 1, 0));
+  const plannedUpTo = (iso) => data.planned.filter((p) => p.date <= iso).reduce((s, p) => s + p.amount, 0);
+  const goalRows = Array.from({ length: Math.min(monthsLeft, 12) }, (_, i) => {
+    const k = i + 1;
+    const dt = new Date(curY, curM + k, 1);
+    return {
+      key: `${dt.getFullYear()}-${dt.getMonth()}`,
+      label: `${dt.getFullYear()}.${dt.getMonth() + 1}`,
+      total: investTotal + data.goal.monthly * k + plannedUpTo(monthEndISO(dt.getFullYear(), dt.getMonth())),
+    };
+  });
+  const plannedTotal = data.planned.reduce((s, p) => s + p.amount, 0);
+  const goalTotal = investTotal + data.goal.monthly * monthsLeft + plannedUpTo(monthEndISO(data.goal.targetY, data.goal.targetM - 1));
+
   const up = (fn) => setData((d) => fn(structuredClone(d)));
 
   const commitPayday = () => {
@@ -300,16 +332,34 @@ export default function MoneyBoard() {
     setEditPay(false);
   };
 
+  const acctId = eAcct || data.accounts[0]?.id;
+  const acctName = (id) => data.accounts.find((a) => a.id === id)?.name ?? "삭제된 계좌";
+
   const addExpense = () => {
     const n = parseAmt(eAmt);
     if (!n || n <= 0) return;
-    const entry = { id: uid(), date: eDate || todayISO, text: eText.trim() || "지출", amount: n, src: eSrc, ts: Date.now() };
+    const base = { id: uid(), date: eDate || todayISO, amount: n, ts: Date.now() };
+    const entry =
+      eKind === "income"
+        ? { ...base, text: eText.trim() || "수입", kind: "income", acct: acctId }
+        : { ...base, text: eText.trim() || "지출", src: eSrc };
     up((d) => {
       d.expenses.unshift(entry);
       d.expenses = d.expenses.slice(0, 400);
       return d;
     });
     setEAmt(""); setEText("");
+  };
+
+  const addPlanned = () => {
+    const n = parseAmt(pAmt);
+    if (!n || n <= 0) return;
+    up((d) => {
+      d.planned.push({ id: uid(), date: pDate || todayISO, amount: n, memo: pMemo.trim() || "예정 수입" });
+      d.planned.sort((x, y) => x.date.localeCompare(y.date));
+      return d;
+    });
+    setPAmt(""); setPMemo("");
   };
 
   const removeExpense = (id) => {
@@ -320,7 +370,10 @@ export default function MoneyBoard() {
   };
 
   const startExpEdit = (e) =>
-    setExpEdit({ id: e.id, date: e.date, amt: String(e.amount), text: e.text, src: e.src });
+    setExpEdit({
+      id: e.id, date: e.date, amt: String(e.amount), text: e.text,
+      src: e.src ?? "week", kind: e.kind === "income" ? "income" : "expense", acct: e.acct ?? acctId,
+    });
 
   const saveExpEdit = () => {
     const n = parseAmt(expEdit.amt);
@@ -329,9 +382,14 @@ export default function MoneyBoard() {
       const e = d.expenses.find((x) => x.id === expEdit.id);
       if (!e) return d;
       e.date = expEdit.date || e.date;
-      e.text = expEdit.text.trim() || "지출";
       e.amount = n;
-      e.src = expEdit.src;
+      if (expEdit.kind === "income") {
+        e.text = expEdit.text.trim() || "수입";
+        e.acct = expEdit.acct;
+      } else {
+        e.text = expEdit.text.trim() || "지출";
+        e.src = expEdit.src;
+      }
       return d; // 잔액은 기준값에서 다시 계산되므로 따로 가감하지 않는다
     });
     setExpEdit(null);
@@ -428,34 +486,51 @@ export default function MoneyBoard() {
             />
           </div>
 
-          {/* 지출 입력 */}
-          <div className="flex flex-wrap gap-2 mt-4">
+          {/* 지출 / 수입 입력 */}
+          <div className="flex rounded overflow-hidden w-fit mt-4" style={{ border: `1px solid ${C.line}` }}>
+            {[["expense", "지출"], ["income", "수입"]].map(([k, label]) => (
+              <button key={k} onClick={() => setEKind(k)} className="text-[11px] px-3 py-1"
+                style={{ background: eKind === k ? (k === "income" ? C.green : C.ink) : "#fff", color: eKind === k ? "#fff" : C.sub }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-2 mt-2">
             <input type="date" value={eDate} onChange={(e) => setEDate(e.target.value)}
               className="text-[11px] rounded px-1.5 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.sub }} />
             <input value={eAmt} onChange={(e) => setEAmt(e.target.value)} placeholder="금액(원)" inputMode="decimal"
               onKeyDown={(e) => e.key === "Enter" && addExpense()}
               className="w-16 text-sm font-mono rounded px-2 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff" }} />
-            <input value={eText} onChange={(e) => setEText(e.target.value)} placeholder="내용 (예: 점심)"
+            <input value={eText} onChange={(e) => setEText(e.target.value)} placeholder={eKind === "income" ? "내용 (예: 월급)" : "내용 (예: 점심)"}
               onKeyDown={(e) => e.key === "Enter" && addExpense()}
               className="flex-1 min-w-[90px] text-sm rounded px-2 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff" }} />
-            <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
-              {[["week", "쓸돈"], ["box", "박스"]].map(([k, label]) => (
-                <button key={k} onClick={() => setESrc(k)}
-                  className="text-[11px] px-2.5"
-                  style={{
-                    background: eSrc === k ? (k === "week" ? C.green : C.blue) : "#fff",
-                    color: eSrc === k ? "#fff" : C.sub,
-                  }}>
-                  {label}
-                </button>
-              ))}
-            </div>
-            <button onClick={addExpense} className="text-xs px-3 py-1.5 rounded text-white" style={{ background: C.ink }}>
+            {eKind === "income" ? (
+              <select value={acctId} onChange={(e) => setEAcct(e.target.value)}
+                className="text-[11px] rounded px-1.5 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.ink }}>
+                {data.accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            ) : (
+              <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                {[["week", "쓸돈"], ["box", "박스"]].map(([k, label]) => (
+                  <button key={k} onClick={() => setESrc(k)}
+                    className="text-[11px] px-2.5"
+                    style={{
+                      background: eSrc === k ? (k === "week" ? C.green : C.blue) : "#fff",
+                      color: eSrc === k ? "#fff" : C.sub,
+                    }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            <button onClick={addExpense} className="text-xs px-3 py-1.5 rounded text-white" style={{ background: eKind === "income" ? C.green : C.ink }}>
               적기
             </button>
           </div>
           <div className="text-[10px] mt-2" style={{ color: C.sub }}>
-            '쓸돈'은 주간 예산에서 차감, '박스'는 세이프박스에서 차감 — 예산은 안 건드려요. 계좌 잔액은 자동으로 따라 움직여요.
+            {eKind === "income"
+              ? "수입은 고른 계좌 잔액에 더해져요. 주간 '쓸돈' 합계에는 안 들어가요."
+              : "'쓸돈'은 주간 예산에서 차감, '박스'는 세이프박스에서 차감 — 예산은 안 건드려요. 계좌 잔액은 자동으로 따라 움직여요."}
           </div>
         </Card>
 
@@ -504,7 +579,7 @@ export default function MoneyBoard() {
                 </div>
                 {dates.map((dt) => {
                   const dayList = list.filter((e) => e.date === dt);
-                  const dSum = dayList.reduce((s, e) => s + e.amount, 0);
+                  const dSum = dayList.filter((e) => e.kind !== "income").reduce((s, e) => s + e.amount, 0);
                   return (
                     <div key={dt}>
                       <div className="flex justify-between pt-2 pb-1 text-[10px]" style={{ color: C.sub }}>
@@ -522,15 +597,22 @@ export default function MoneyBoard() {
                             <input value={expEdit.text} onChange={(ev) => setExpEdit({ ...expEdit, text: ev.target.value })}
                               onKeyDown={(ev) => { if (ev.key === "Enter") saveExpEdit(); if (ev.key === "Escape") setExpEdit(null); }}
                               className="flex-1 min-w-[80px] text-sm rounded px-2 py-1 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff" }} />
-                            <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
-                              {[["week", "쓸돈"], ["box", "박스"]].map(([k, label]) => (
-                                <button key={k} onClick={() => setExpEdit({ ...expEdit, src: k })}
-                                  className="text-[11px] px-2 py-1"
-                                  style={{ background: expEdit.src === k ? (k === "week" ? C.green : C.blue) : "#fff", color: expEdit.src === k ? "#fff" : C.sub }}>
-                                  {label}
-                                </button>
-                              ))}
-                            </div>
+                            {expEdit.kind === "income" ? (
+                              <select value={expEdit.acct} onChange={(ev) => setExpEdit({ ...expEdit, acct: ev.target.value })}
+                                className="text-[11px] rounded px-1.5 py-1 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.ink }}>
+                                {data.accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                              </select>
+                            ) : (
+                              <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                                {[["week", "쓸돈"], ["box", "박스"]].map(([k, label]) => (
+                                  <button key={k} onClick={() => setExpEdit({ ...expEdit, src: k })}
+                                    className="text-[11px] px-2 py-1"
+                                    style={{ background: expEdit.src === k ? (k === "week" ? C.green : C.blue) : "#fff", color: expEdit.src === k ? "#fff" : C.sub }}>
+                                    {label}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
                             <button onClick={saveExpEdit} className="text-xs px-2.5 py-1 rounded text-white" style={{ background: C.green }}>저장</button>
                             <button onClick={() => setExpEdit(null)} className="text-xs px-2 py-1 rounded" style={{ border: `1px solid ${C.line}`, color: C.sub }}>취소</button>
                           </div>
@@ -538,10 +620,14 @@ export default function MoneyBoard() {
                           <div key={e.id} onClick={() => startExpEdit(e)} title="눌러서 수정"
                             className="flex items-center gap-2 py-1.5 text-sm cursor-pointer" style={{ borderTop: `1px dotted ${C.line}` }}>
                             <span className="flex-1 min-w-0 truncate">{e.text}</span>
-                            {e.src === "box" && (
+                            {e.kind === "income" ? (
+                              <span className="text-[9px] px-1 rounded" style={{ background: "rgba(46,92,70,0.12)", color: C.green }}>{acctName(e.acct)}</span>
+                            ) : e.src === "box" ? (
                               <span className="text-[9px] px-1 rounded" style={{ background: "rgba(76,101,128,0.12)", color: C.blue }}>박스</span>
-                            )}
-                            <span className="font-mono tabular-nums" style={{ color: e.src === "box" ? C.blue : C.ink }}>−{fmt(e.amount)}</span>
+                            ) : null}
+                            <span className="font-mono tabular-nums" style={{ color: e.kind === "income" ? C.green : e.src === "box" ? C.blue : C.ink }}>
+                              {e.kind === "income" ? "+" : "−"}{fmt(e.amount)}
+                            </span>
                             <button onClick={(ev) => { ev.stopPropagation(); removeExpense(e.id); }} style={{ color: C.sub }}>×</button>
                           </div>
                         )
@@ -554,52 +640,84 @@ export default function MoneyBoard() {
           })}
         </Card>
 
-        {/* 로드맵 */}
-        <Card title="로드맵" right={<EditToggle on={editRoad} onClick={() => setEditRoad(!editRoad)} />}>
-          <div className="ml-1.5" style={{ borderLeft: `2px solid ${C.line}` }}>
-            {data.roadmap.map((r) => (
-              <div key={r.id} className="relative pl-4 pb-4">
-                <button
-                  onClick={() => up((d) => { const x = d.roadmap.find((y) => y.id === r.id); x.done = !x.done; return d; })}
-                  className="rounded-full"
-                  style={{
-                    position: "absolute", left: -7, top: 3, width: 12, height: 12,
-                    border: `2px solid ${r.done ? C.green : C.sub}`,
-                    background: r.done ? C.green : C.card,
-                  }}
-                  title="누르면 완료 표시"
-                />
-                {editRoad ? (
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center gap-2">
-                      <input value={r.when}
-                        onChange={(e) => up((d) => { d.roadmap.find((y) => y.id === r.id).when = e.target.value; return d; })}
-                        className="w-20 text-[11px] font-mono outline-none bg-transparent" style={{ borderBottom: `1px dotted ${C.sub}` }} />
-                      <button onClick={() => up((d) => { d.roadmap = d.roadmap.filter((y) => y.id !== r.id); return d; })}
-                        style={{ color: C.red }}><Trash2 size={13} /></button>
-                    </div>
-                    <input value={r.text}
-                      onChange={(e) => up((d) => { d.roadmap.find((y) => y.id === r.id).text = e.target.value; return d; })}
-                      className="w-full text-sm outline-none bg-transparent" style={{ borderBottom: `1px dotted ${C.line}` }} />
-                  </div>
-                ) : (
-                  <>
-                    <div className="text-[11px] font-mono font-semibold" style={{ color: r.done ? C.sub : C.green }}>{r.when}</div>
-                    <div className="text-sm leading-5" style={{ color: r.done ? C.sub : C.ink }}>{r.text}</div>
-                  </>
-                )}
+        {/* 모이는 돈 */}
+        <Card title="모이는 돈">
+          <div className="text-[11px]" style={{ color: C.sub }}>{data.goal.targetY}년 {data.goal.targetM}월까지</div>
+          <div className="font-mono tabular-nums text-4xl font-semibold" style={{ color: C.green }}>{fmt(goalTotal)}</div>
+          <div className="text-[10px] mt-1" style={{ color: C.sub }}>
+            지금 투자 {fmt(investTotal)} + 월 {fmt(data.goal.monthly)} × {monthsLeft}개월
+            {plannedTotal > 0 && <> + 예정 수입 {fmt(plannedTotal)}</>}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3 pt-3 text-[11px]" style={{ borderTop: `1px solid ${C.line}`, color: C.sub }}>
+            <span className="flex items-center gap-1">
+              월 적립 <Amount value={data.goal.monthly} onCommit={(n) => up((d) => { d.goal.monthly = n; return d; })} />
+            </span>
+            <span className="flex items-center gap-1">
+              목표
+              <input type="number" inputMode="numeric" value={data.goal.targetY} min={curY} max={curY + 30}
+                onChange={(e) => up((d) => { d.goal.targetY = Math.min(curY + 30, Math.max(curY, Number(e.target.value) || curY)); return d; })}
+                className="w-14 text-sm font-mono rounded px-1 py-0.5 outline-none text-center"
+                style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.ink }} />
+              년
+              <input type="number" inputMode="numeric" value={data.goal.targetM} min={1} max={12}
+                onChange={(e) => up((d) => { d.goal.targetM = Math.min(12, Math.max(1, Number(e.target.value) || 1)); return d; })}
+                className="w-11 text-sm font-mono rounded px-1 py-0.5 outline-none text-center"
+                style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.ink }} />
+              월
+            </span>
+          </div>
+
+          {goalRows.length > 0 ? (
+            <div className="mt-3">
+              <div className="flex justify-between text-[10px] pb-1" style={{ color: C.sub, borderBottom: `1px solid ${C.ink}` }}>
+                <span>월</span><span>누적</span>
+              </div>
+              {goalRows.map((r) => (
+                <div key={r.key} className="flex justify-between py-1 text-[12px]" style={{ borderBottom: `1px dotted ${C.line}` }}>
+                  <span className="font-mono" style={{ color: C.sub }}>{r.label}</span>
+                  <span className="font-mono tabular-nums">{fmt(r.total)}</span>
+                </div>
+              ))}
+              {monthsLeft > 12 && (
+                <div className="text-[10px] mt-1" style={{ color: C.sub }}>앞으로 12개월만 표시 — 목표까지는 {monthsLeft}개월</div>
+              )}
+            </div>
+          ) : (
+            <div className="text-[11px] mt-3" style={{ color: C.sub }}>목표 시점이 이번 달이거나 지났어요 — 위에서 목표를 앞으로 옮겨보세요.</div>
+          )}
+
+          <div className="mt-4 pt-3" style={{ borderTop: `1px solid ${C.line}` }}>
+            <div className="text-[11px] mb-1" style={{ color: C.sub }}>
+              예정 수입{plannedTotal > 0 && <span className="font-mono tabular-nums"> · 합계 {fmt(plannedTotal)}</span>}
+            </div>
+            {data.planned.map((p) => (
+              <div key={p.id} className="flex items-center gap-2 py-1.5 text-sm" style={{ borderTop: `1px dotted ${C.line}` }}>
+                <span className="text-[11px] font-mono shrink-0" style={{ color: C.sub }}>{md(fromISO(p.date))}</span>
+                <span className="flex-1 min-w-0 truncate">{p.memo}</span>
+                <span className="font-mono tabular-nums" style={{ color: C.green }}>+{fmt(p.amount)}</span>
+                <button onClick={() => up((d) => { d.planned = d.planned.filter((x) => x.id !== p.id); return d; })}
+                  style={{ color: C.sub }}>×</button>
               </div>
             ))}
+            <div className="flex flex-wrap gap-2 mt-2">
+              <input type="date" value={pDate} onChange={(e) => setPDate(e.target.value)}
+                className="text-[11px] rounded px-1.5 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff", color: C.sub }} />
+              <input value={pAmt} onChange={(e) => setPAmt(e.target.value)} placeholder="금액(원)" inputMode="decimal"
+                onKeyDown={(e) => e.key === "Enter" && addPlanned()}
+                className="w-16 text-sm font-mono rounded px-2 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff" }} />
+              <input value={pMemo} onChange={(e) => setPMemo(e.target.value)} placeholder="메모 (예: 장려금)"
+                onKeyDown={(e) => e.key === "Enter" && addPlanned()}
+                className="flex-1 min-w-[80px] text-sm rounded px-2 py-1.5 outline-none" style={{ border: `1px solid ${C.line}`, background: "#fff" }} />
+              <button onClick={addPlanned} className="text-xs px-3 py-1.5 rounded flex items-center gap-1"
+                style={{ border: `1px dashed ${C.sub}`, color: C.sub }}>
+                <Plus size={12} /> 추가
+              </button>
+            </div>
+            <div className="text-[10px] mt-2" style={{ color: C.sub }}>
+              실제로 들어오면 위 입력에서 '수입'으로 적고, 여기서는 지우세요.
+            </div>
           </div>
-          {editRoad && (
-            <button
-              onClick={() => up((d) => { d.roadmap.push({ id: uid(), when: "언제", text: "새 이정표", done: false }); return d; })}
-              className="w-full mt-1 py-2 rounded text-xs flex items-center justify-center gap-1"
-              style={{ border: `1px dashed ${C.sub}`, color: C.sub }}
-            >
-              <Plus size={13} /> 이정표 추가
-            </button>
-          )}
         </Card>
 
         {/* 계좌 */}
