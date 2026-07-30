@@ -20,18 +20,20 @@ const ROLES = {
   invest: { label: "투자", dot: C.ink },
 };
 const ROLE_ORDER = ["hub", "spend", "save", "invest"];
+/* 어떤 역할 계좌가 어떤 출처의 지출을 떠안는지 */
+const ROLE_SRC = { spend: "week", save: "box" };
 
 const KEY = "minjun-money-v1";
 
 const SEED = {
-  v: 3,
+  v: 4,
   payday: 25,
   weeklyBudget: 10,
   accounts: [
-    { id: "a1", name: "주계좌", note: "수입이 들어오는 곳 · 고정비 대기", amount: 0, role: "hub" },
-    { id: "a2", name: "세이프박스", note: "일정 없이 꺼내 쓰는 자유 풀", amount: 0, role: "save" },
-    { id: "a3", name: "생활비 통장", note: "주간 예산이 나가는 곳", amount: 0, role: "spend" },
-    { id: "a4", name: "투자 계좌", note: "원금 기록 — 자주 안 보기", amount: 0, role: "invest" },
+    { id: "a1", name: "주계좌", note: "수입이 들어오는 곳 · 고정비 대기", baseAmount: 0, baseTs: 0, role: "hub" },
+    { id: "a2", name: "세이프박스", note: "일정 없이 꺼내 쓰는 자유 풀", baseAmount: 0, baseTs: 0, role: "save" },
+    { id: "a3", name: "생활비 통장", note: "주간 예산이 나가는 곳", baseAmount: 0, baseTs: 0, role: "spend" },
+    { id: "a4", name: "투자 계좌", note: "원금 기록 — 자주 안 보기", baseAmount: 0, baseTs: 0, role: "invest" },
   ],
   expenses: [],
   roadmap: [
@@ -87,17 +89,46 @@ function paydayInfo(payday) {
   const days = Math.max(1, Math.round((next - today) / 86400000));
   return { days, label: `${next.getMonth() + 1}월 ${next.getDate()}일 (${WD[next.getDay()]})` };
 }
-/* 어떤 버전의 저장본이 와도 v3 형태로 맞춰줌 */
-const normalize = (p) => ({
-  v: 3,
-  payday: p.payday ?? 24,
-  weeklyBudget: p.weeklyBudget ?? 11,
-  accounts: Array.isArray(p.accounts) ? p.accounts : structuredClone(SEED.accounts),
-  expenses: Array.isArray(p.expenses) ? p.expenses : [],
-  // 구버전 백업에 todos가 있어도 조용히 버린다
-  roadmap: Array.isArray(p.roadmap) ? p.roadmap : structuredClone(SEED.roadmap),
-  routine: typeof p.routine === "string" ? p.routine : SEED.routine,
-});
+/* 어떤 버전의 저장본이 와도 v4 형태로 맞춰줌 */
+const normalize = (p) => {
+  const now = Date.now();
+  const src = Array.isArray(p.expenses) ? p.expenses : [];
+  return {
+    v: 4,
+    payday: Number.isFinite(p.payday) ? p.payday : SEED.payday,
+    weeklyBudget: Number.isFinite(p.weeklyBudget) ? p.weeklyBudget : SEED.weeklyBudget,
+    accounts: (Array.isArray(p.accounts) ? p.accounts : structuredClone(SEED.accounts)).map((a) => ({
+      id: a.id ?? uid(),
+      name: a.name ?? "계좌",
+      note: a.note ?? "",
+      role: ROLES[a.role] ? a.role : "hub",
+      // 구버전(가감식) 저장본의 amount는 이미 지출이 빠진 값 → 그대로 기준값으로 삼고
+      // 기준시각을 '지금'으로 둬서 과거 지출이 다시 빠지지 않게 한다
+      baseAmount: Number.isFinite(a.baseAmount) ? a.baseAmount : Number.isFinite(a.amount) ? a.amount : 0,
+      baseTs: Number.isFinite(a.baseTs) ? a.baseTs : now,
+    })),
+    expenses: src.map((e) => ({
+      ...e,
+      // ts 없는 구버전 기록은 날짜로 보정하되, 마이그레이션 시각보다는 반드시 앞에 둔다
+      ts: Number.isFinite(e.ts) ? e.ts : Math.min(fromISO(e.date).getTime(), now - 1),
+    })),
+    // 구버전 백업에 todos가 있어도 조용히 버린다
+    roadmap: Array.isArray(p.roadmap) ? p.roadmap : structuredClone(SEED.roadmap),
+    routine: typeof p.routine === "string" ? p.routine : SEED.routine,
+  };
+};
+
+/* 표시 잔액 = 기준값 − 기준시각 이후의 해당 역할 지출 */
+const balanceOf = (d, a) => {
+  const src = ROLE_SRC[a.role];
+  let v = a.baseAmount;
+  if (src) {
+    for (const e of d.expenses) {
+      if (e.src === src && e.ts > a.baseTs) v -= e.amount;
+    }
+  }
+  return Math.round(v * 100) / 100;
+};
 
 /* ── 소형 컴포넌트 ─────────────────────────────────── */
 function Amount({ value, onCommit, big = false, color = C.ink }) {
@@ -177,6 +208,8 @@ export default function MoneyBoard() {
   const [eDate, setEDate] = useState(toISO(new Date()));
   const [eSrc, setESrc] = useState("week");
   const [expEdit, setExpEdit] = useState(null); // { id, date, amt, text, src }
+  const [editPay, setEditPay] = useState(false);
+  const [payInput, setPayInput] = useState("");
   const loaded = useRef(false);
   const timer = useRef(null);
 
@@ -225,7 +258,8 @@ export default function MoneyBoard() {
   const perDay = Math.max(remaining, 0) / daysLeftWeek;
   const todaySpent = data.expenses.filter((e) => e.date === todayISO).reduce((s, e) => s + e.amount, 0);
 
-  const boxTotal = data.accounts.filter((a) => a.role === "save").reduce((s, a) => s + a.amount, 0);
+  const bal = (a) => balanceOf(data, a);
+  const boxTotal = data.accounts.filter((a) => a.role === "save").reduce((s, a) => s + bal(a), 0);
   const boxUsed = data.expenses.filter((e) => e.src === "box").reduce((s, e) => s + e.amount, 0);
   const boxThisWeek = data.expenses.filter((e) => e.src === "box" && inThisWeek(e.date)).reduce((s, e) => s + e.amount, 0);
 
@@ -239,28 +273,40 @@ export default function MoneyBoard() {
   const cycleWeek = data.expenses.filter((e) => e.src === "week" && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
   const cycleBox = data.expenses.filter((e) => e.src === "box" && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
 
-  const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + a.amount, 0);
-  const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + a.amount, 0);
+  const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
+  const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + bal(a), 0);
+
+  /* 역할 계좌가 없거나 중복이면 지출이 엉뚱하게 반영된다 */
+  const roleWarn = ["spend", "save"]
+    .map((r) => {
+      const n = data.accounts.filter((a) => a.role === r).length;
+      if (n === 1) return null;
+      return `'${ROLES[r].label}' 계좌가 ${n === 0 ? "없어요" : `${n}개예요`}`;
+    })
+    .filter(Boolean)
+    .join(" · ");
 
   const pay = paydayInfo(data.payday);
   const over = remaining < 0;
 
   const up = (fn) => setData((d) => fn(structuredClone(d)));
 
-  const shiftBalance = (d, src, delta) => {
-    const role = src === "week" ? "spend" : "save";
-    const acc = d.accounts.find((a) => a.role === role);
-    if (acc) acc.amount = Math.round((acc.amount + delta) * 100) / 100;
+  const commitPayday = () => {
+    const n = Math.round(parseFloat(payInput));
+    if (Number.isFinite(n)) {
+      const v = Math.min(31, Math.max(1, n));
+      up((d) => { d.payday = v; return d; });
+    }
+    setEditPay(false);
   };
 
   const addExpense = () => {
     const n = parseAmt(eAmt);
     if (!n || n <= 0) return;
-    const entry = { id: uid(), date: eDate || todayISO, text: eText.trim() || "지출", amount: n, src: eSrc };
+    const entry = { id: uid(), date: eDate || todayISO, text: eText.trim() || "지출", amount: n, src: eSrc, ts: Date.now() };
     up((d) => {
       d.expenses.unshift(entry);
       d.expenses = d.expenses.slice(0, 400);
-      shiftBalance(d, entry.src, -n);
       return d;
     });
     setEAmt(""); setEText("");
@@ -268,8 +314,6 @@ export default function MoneyBoard() {
 
   const removeExpense = (id) => {
     up((d) => {
-      const e = d.expenses.find((x) => x.id === id);
-      if (e) shiftBalance(d, e.src, e.amount);
       d.expenses = d.expenses.filter((x) => x.id !== id);
       return d;
     });
@@ -284,13 +328,11 @@ export default function MoneyBoard() {
     up((d) => {
       const e = d.expenses.find((x) => x.id === expEdit.id);
       if (!e) return d;
-      shiftBalance(d, e.src, e.amount); // 기존 금액을 원래 출처에 되돌린 뒤
       e.date = expEdit.date || e.date;
       e.text = expEdit.text.trim() || "지출";
       e.amount = n;
       e.src = expEdit.src;
-      shiftBalance(d, e.src, -n); // 새 금액을 새 출처에서 차감
-      return d;
+      return d; // 잔액은 기준값에서 다시 계산되므로 따로 가감하지 않는다
     });
     setExpEdit(null);
   };
@@ -321,8 +363,32 @@ export default function MoneyBoard() {
             style={{ border: `2px dashed ${C.red}`, color: C.red, transform: "rotate(-4deg)", background: "rgba(179,64,47,0.04)" }}
           >
             <div className="text-[9px] tracking-widest">다음 입금</div>
-            <div className="font-mono text-2xl leading-none font-bold tabular-nums">D-{pay.days}</div>
-            <div className="text-[10px] mt-0.5">{pay.label}</div>
+            {editPay ? (
+              <>
+                <input
+                  autoFocus
+                  type="number"
+                  min={1}
+                  max={31}
+                  inputMode="numeric"
+                  defaultValue={data.payday}
+                  onChange={(e) => setPayInput(e.target.value)}
+                  onBlur={commitPayday}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitPayday();
+                    if (e.key === "Escape") setEditPay(false);
+                  }}
+                  className="font-mono text-2xl leading-none font-bold tabular-nums w-14 text-center rounded outline-none"
+                  style={{ background: "#fff", border: `1px solid ${C.red}`, color: C.red }}
+                />
+                <div className="text-[10px] mt-0.5">며칠에 들어와요?</div>
+              </>
+            ) : (
+              <button onClick={() => { setPayInput(String(data.payday)); setEditPay(true); }} title="눌러서 급여일 변경">
+                <div className="font-mono text-2xl leading-none font-bold tabular-nums">D-{pay.days}</div>
+                <div className="text-[10px] mt-0.5">{pay.label}</div>
+              </button>
+            )}
           </div>
         </header>
 
@@ -541,6 +607,11 @@ export default function MoneyBoard() {
           title="계좌"
           right={<EditToggle on={editAcc} onClick={() => setEditAcc(!editAcc)} />}
         >
+          {roleWarn && (
+            <div className="text-[11px] mb-2 px-2 py-1.5 rounded leading-4" style={{ background: "rgba(179,64,47,0.07)", color: C.red }}>
+              {roleWarn} — 지출이 잔액에 제대로 반영되려면 '쓸돈'·'모음' 역할이 하나씩 있어야 해요.
+            </div>
+          )}
           <div>
             {data.accounts.map((a, i) => (
               <div key={a.id} className="flex items-center gap-2 py-2.5" style={{ borderTop: i === 0 ? "none" : `1px solid ${C.line}` }}>
@@ -571,7 +642,15 @@ export default function MoneyBoard() {
                     </>
                   )}
                 </div>
-                <Amount value={a.amount} onCommit={(n) => up((d) => { d.accounts.find((x) => x.id === a.id).amount = n; return d; })} />
+                <Amount
+                  value={bal(a)}
+                  onCommit={(n) => up((d) => {
+                    const t = d.accounts.find((x) => x.id === a.id);
+                    t.baseAmount = n;
+                    t.baseTs = Date.now(); // 여기서부터 다시 세기 시작
+                    return d;
+                  })}
+                />
                 {editAcc && (
                   <button onClick={() => up((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id); return d; })}
                     style={{ color: C.red }}><Trash2 size={15} /></button>
@@ -581,7 +660,7 @@ export default function MoneyBoard() {
           </div>
           {editAcc && (
             <button
-              onClick={() => up((d) => { d.accounts.push({ id: uid(), name: "새 계좌", note: "", amount: 0, role: "hub" }); return d; })}
+              onClick={() => up((d) => { d.accounts.push({ id: uid(), name: "새 계좌", note: "", baseAmount: 0, baseTs: Date.now(), role: "hub" }); return d; })}
               className="w-full mt-1 py-2 rounded text-xs flex items-center justify-center gap-1"
               style={{ border: `1px dashed ${C.sub}`, color: C.sub }}
             >
