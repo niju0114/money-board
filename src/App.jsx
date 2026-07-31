@@ -30,6 +30,10 @@ const SEED = {
   unit: "won",
   payday: 25,
   weekStart: 0, // 주 시작 요일 — 가계부 묶음에만 쓴다 (0=일, 1=월)
+  saveGoal: 0, // 이번 사이클 목표 저축액 — 급여일이 지나도 유지된다
+  menus: [], // 개인 데이터는 시드에 두지 않는다
+  saveGoal: 0, // 이번 사이클에 남기고 싶은 금액 (사이클이 바뀌어도 유지)
+  menus: [], // 공개 저장소이므로 개인 메뉴는 넣지 않는다
   accounts: [
     { id: "a1", name: "주계좌", note: "수입이 들어오는 곳", baseAmount: 0, baseTs: 0, role: "hub" },
     { id: "a2", name: "세이프박스", note: "일정 없이 꺼내 쓰는 돈", baseAmount: 0, baseTs: 0, role: "save" },
@@ -207,6 +211,10 @@ const normalize = (p) => {
     unit: "won",
     payday: Number.isFinite(p.payday) ? p.payday : SEED.payday,
     weekStart: p.weekStart === 1 ? 1 : 0,
+    saveGoal: Math.max(0, cv(p.saveGoal)),
+    menus: Array.isArray(p.menus)
+      ? p.menus.map((m) => ({ id: m.id ?? uid(), name: m.name ?? "메뉴", price: Math.max(0, cv(m.price)) }))
+      : [],
     accounts,
     entries,
     rules: Array.isArray(p.rules)
@@ -389,6 +397,8 @@ export default function MoneyBoard() {
   const [showSend, setShowSend] = useState(false);
   const [sendAmt, setSendAmt] = useState("");
   const [showFuture, setShowFuture] = useState(false);
+  const [menuName, setMenuName] = useState("");
+  const [menuPrice, setMenuPrice] = useState("");
   const [pMonth, setPMonth] = useState("");
   const [pAmt, setPAmt] = useState("");
   const [pMemo, setPMemo] = useState("");
@@ -475,11 +485,18 @@ export default function MoneyBoard() {
   // 오늘 쓸수록 오늘 예산 자체가 줄어드는 일을 막는다
   const dayBase = spendBal + todaySpent;
   const spreadDays = Math.max(MIN_SPREAD_DAYS, pay.days);
-  const todayBudget = perDayFrom(dayBase, pay.days);
+  // 목표가 잔액보다 크면 쓸 돈이 없어지므로 잔액의 80%로 제한한다
+  const goalCapped = data.saveGoal > dayBase;
+  const saveGoal = goalCapped ? Math.floor(dayBase * 0.8) : data.saveGoal;
+  const budgetBase = Math.max(0, dayBase - saveGoal);
+  const todayBudget = perDayFrom(budgetBase, pay.days);
   const todayLeft = todayBudget - todaySpent;
   const overToday = todayLeft < 0;
   // 지금 멈추면 내일 예산 — 오늘 끝 잔액을 하루 줄어든 날수로 나눈다
-  const tomorrowBudget = perDayFrom(spendBal, pay.days - 1);
+  const tomorrowBudget = perDayFrom(Math.max(0, spendBal - saveGoal), pay.days - 1);
+  const weekEstimate = todayBudget * 7;
+  // 계획대로 쓰면 사이클 끝에 남을 돈 — 목표와의 차이로 앞서는지 뒤처지는지 본다
+  const paceDiff = spendBal - todayBudget * pay.days - saveGoal;
 
   const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
   const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + bal(a), 0);
@@ -621,6 +638,17 @@ export default function MoneyBoard() {
       runRules(d); // 오늘 등록한 규칙이 오늘 도래분이면 새로고침 없이 바로 기록된다
       return d;
     });
+
+  const addMenu = () => {
+    const n = parseWon(menuPrice);
+    if (!menuName.trim() || n == null || n < 0) return;
+    up((d) => {
+      d.menus.push({ id: uid(), name: menuName.trim(), price: n });
+      d.menus.sort((a, b) => a.price - b.price);
+      return d;
+    });
+    setMenuName(""); setMenuPrice("");
+  };
 
   /* 아낀 돈을 투자 계좌로 보낸다 */
   const sendSaved = () => {
@@ -796,6 +824,35 @@ export default function MoneyBoard() {
             <div className="text-[13px] mt-1" style={{ color: C.sub }}>
               쓸돈 {fmt(spendBal)} · 급여일까지 {pay.days}일 · 하루 {fmt(todayBudget)}
             </div>
+            <div className="text-[13px]" style={{ color: C.sub }}>
+              이번 주 ≈ {fmt(weekEstimate)}
+              {saveGoal > 0 && ` · 목표 ${fmt(saveGoal)} ${paceDiff >= 0 ? `${fmt(paceDiff)} 앞서는 중` : `${fmt(-paceDiff)} 뒤처짐`}`}
+            </div>
+
+            {/* 오늘 가능한 것 */}
+            <div className="flex flex-wrap items-center gap-1.5 mt-3">
+              {data.menus.length === 0 ? (
+                <button onClick={() => setTab("manage")} className="text-[13px]" style={{ color: C.accent }}>
+                  메뉴 등록하기
+                </button>
+              ) : (
+                [...data.menus]
+                  .sort((a, b) => a.price - b.price)
+                  .slice(0, 3)
+                  .map((m) => {
+                    const ok = m.price <= todayLeft;
+                    return (
+                      <button key={m.id}
+                        onClick={() => { setEKind("expense"); setEText(m.name); setEAmt(String(m.price)); }}
+                        className="text-[13px] px-2.5 py-1 rounded-full"
+                        style={{ background: C.fill, color: ok ? C.text : C.sub }}>
+                        {m.name} {fmt(m.price)}
+                        {!ok && ` · ${fmt(m.price - todayLeft)} 부족`}
+                      </button>
+                    );
+                  })
+              )}
+            </div>
           </div>
 
           {/* 입력 — 한 줄 */}
@@ -850,13 +907,35 @@ export default function MoneyBoard() {
             <span className="text-[15px] flex-1">오늘 예산</span>
             <span className="text-[15px] tabular-nums">{fmt(todayBudget)}</span>
           </Row>
+          <Row>
+            <span className="text-[15px] flex-1">목표 저축액</span>
+            <Amount value={data.saveGoal} className="text-[15px]"
+              onCommit={(n) => up((d) => { d.saveGoal = Math.max(0, n); return d; })} />
+          </Row>
+          {goalCapped && (
+            <Row>
+              <span className="text-[13px]" style={{ color: C.danger }}>
+                목표가 쓸돈 잔액보다 커서 잔액의 80%({fmt(saveGoal)})로 낮춰 계산했어요.
+              </span>
+            </Row>
+          )}
           <Row align="items-start">
             <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산 근거</span>
             <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
-              {fmt(dayBase)} ÷ {spreadDays}일 = 하루 {fmt(todayBudget)}
+              {saveGoal > 0
+                ? `${fmt(dayBase)} − 목표 ${fmt(saveGoal)} = ${fmt(budgetBase)} ÷ ${spreadDays}일 = 하루 ${fmt(todayBudget)}`
+                : `${fmt(dayBase)} ÷ ${spreadDays}일 = 하루 ${fmt(todayBudget)}`}
               {spreadDays !== pay.days && ` (최소 ${MIN_SPREAD_DAYS}일로 폄)`}
             </span>
           </Row>
+          {saveGoal > 0 && (
+            <Row>
+              <span className="text-[13px] flex-1" style={{ color: C.sub }}>진행</span>
+              <span className="text-[13px] tabular-nums" style={{ color: paceDiff >= 0 ? C.accent : C.danger }}>
+                목표 {fmt(saveGoal)} · {paceDiff >= 0 ? `${fmt(paceDiff)} 앞서는 중` : `${fmt(-paceDiff)} 뒤처짐`}
+              </span>
+            </Row>
+          )}
           <Row>
             <span className="text-[13px] flex-1" style={{ color: C.sub }}>다음 입금</span>
             <span className="text-[13px]" style={{ color: C.sub }}>{pay.label} · {pay.days}일 남음</span>
@@ -874,6 +953,30 @@ export default function MoneyBoard() {
               쓸돈 {fmt(cycleSpend)} · 전체 {fmt(cycleAll)}
             </span>
           </Row>
+        </Card>
+
+        {/* 내 메뉴 */}
+        <Card title="내 메뉴">
+          {data.menus.length === 0 && (
+            <Row first><span className="text-[15px]" style={{ color: C.sub }}>자주 먹는 것을 등록해 두면 오늘 살 수 있는지 바로 보여줘요.</span></Row>
+          )}
+          {data.menus.map((m, i) => (
+            <Row key={m.id} first={i === 0}>
+              <Field value={m.name} className="flex-1 min-w-0 text-[15px]"
+                onChange={(e) => up((d) => { d.menus.find((x) => x.id === m.id).name = e.target.value; return d; })} />
+              <Amount value={m.price} className="text-[15px]"
+                onCommit={(n) => up((d) => { d.menus.find((x) => x.id === m.id).price = Math.max(0, n); return d; })} />
+              <button onClick={() => up((d) => { d.menus = d.menus.filter((x) => x.id !== m.id); return d; })}
+                style={{ color: C.danger }} title="삭제"><Trash2 size={17} /></button>
+            </Row>
+          ))}
+          <div className="py-3 flex flex-wrap gap-2" style={{ borderTop: data.menus.length ? `1px solid ${C.line}` : "none" }}>
+            <Field value={menuName} onChange={(e) => setMenuName(e.target.value)} placeholder="이름 (예: 김밥)"
+              onKeyDown={(e) => e.key === "Enter" && addMenu()} className="flex-1 min-w-[110px]" />
+            <Field value={menuPrice} onChange={(e) => setMenuPrice(e.target.value)} placeholder="가격" inputMode="decimal"
+              onKeyDown={(e) => e.key === "Enter" && addMenu()} className="w-24 tabular-nums" />
+            <button onClick={addMenu} className="text-[15px] px-3.5 py-2 rounded-[10px]" style={{ color: C.accent }}>추가</button>
+          </div>
         </Card>
 
         {/* 계좌 */}
