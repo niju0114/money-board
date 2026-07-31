@@ -373,6 +373,7 @@ function Tag({ children, tone = "sub" }) {
 /* ── 메인 ─────────────────────────────────────────── */
 export default function MoneyBoard() {
   const [data, setData] = useState(null);
+  const [tab, setTab] = useState("daily"); // daily=자주 보는 것 / manage=가끔 손보는 것
   const [saveState, setSaveState] = useState("");
   const [editAcc, setEditAcc] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -664,6 +665,19 @@ export default function MoneyBoard() {
           )}
         </header>
 
+        {/* 탭 — 매일 볼 것과 가끔 손볼 것을 나눈다 */}
+        <div className="flex rounded-[9px] p-[2px]" style={{ background: C.fill }}>
+          {[["daily", "매일"], ["manage", "관리"]].map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)}
+              className="flex-1 py-1.5 rounded-[7px] text-[14px]"
+              style={tab === k ? { background: C.card, color: C.text, fontWeight: 500 } : { color: C.sub }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === "daily" && (<>
+
         {/* 이번 주 */}
         <Card
           title={`이번 주 · ${data.weekStart === 1 ? "월" : "일"}요일 시작`}
@@ -762,6 +776,10 @@ export default function MoneyBoard() {
             </Row>
           )}
         </Card>
+
+        </>)}
+
+        {tab === "manage" && (<>
 
         {/* 고정 항목 */}
         <Card
@@ -871,6 +889,10 @@ export default function MoneyBoard() {
           </Card>
         )}
 
+        </>)}
+
+        {tab === "daily" && (<>
+
         {/* 가계부 */}
         <Card title="가계부">
           <Row first>
@@ -951,6 +973,10 @@ export default function MoneyBoard() {
             );
           })}
         </Card>
+
+        </>)}
+
+        {tab === "manage" && (<>
 
         {/* 모이는 돈 */}
         <Card title="모이는 돈">
@@ -1108,23 +1134,27 @@ export default function MoneyBoard() {
           </Card>
         )}
 
+        </>)}
+
         <footer className="flex items-center justify-between px-4 text-[13px]" style={{ color: C.sub }}>
           <span>{saveState || "적으면 자동 저장"}</span>
-          <span className="flex items-center gap-4">
-            <button onClick={() => { setShowBackup(!showBackup); if (!showBackup) { setImportText(JSON.stringify(data, null, 2)); setBkMsg(""); } }}>
-              백업
-            </button>
-            {confirmReset ? (
-              <>
-                <button onClick={() => { setData(structuredClone(SEED)); setConfirmReset(false); }} style={{ color: C.danger }}>정말 초기화</button>
-                <button onClick={() => setConfirmReset(false)}>취소</button>
-              </>
-            ) : (
-              <button onClick={() => setConfirmReset(true)} className="flex items-center gap-1">
-                <RotateCcw size={12} /> 초기화
+          {tab === "manage" && (
+            <span className="flex items-center gap-4">
+              <button onClick={() => { setShowBackup(!showBackup); if (!showBackup) { setImportText(JSON.stringify(data, null, 2)); setBkMsg(""); } }}>
+                백업
               </button>
-            )}
-          </span>
+              {confirmReset ? (
+                <>
+                  <button onClick={() => { setData(structuredClone(SEED)); setConfirmReset(false); }} style={{ color: C.danger }}>정말 초기화</button>
+                  <button onClick={() => setConfirmReset(false)}>취소</button>
+                </>
+              ) : (
+                <button onClick={() => setConfirmReset(true)} className="flex items-center gap-1">
+                  <RotateCcw size={12} /> 초기화
+                </button>
+              )}
+            </span>
+          )}
         </footer>
       </div>
     </div>

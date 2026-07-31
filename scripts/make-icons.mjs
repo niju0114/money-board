@@ -5,8 +5,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const OUT = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
-const BG = [0x2e, 0x5c, 0x46]; // #2E5C46 테마 그린
-const FG = [0xef, 0xf2, 0xec]; // #EFF2EC 종이색
+const BG = [0x34, 0xc7, 0x59]; // #34C759 포인트 그린
+const FG = [0xff, 0xff, 0xff]; // 흰 글리프
 
 /* ── PNG 인코딩 (8bit RGBA, 필터 없음) ── */
 const crcTable = [];
