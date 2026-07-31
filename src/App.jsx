@@ -201,6 +201,7 @@ const normalize = (p) => {
             days: Number(p.budget.days) || 1,
             weekDays: Number(p.budget.weekDays) || 1,
             until: typeof p.budget.until === "string" ? p.budget.until : null,
+            added: Math.max(0, cv(p.budget.added)), // 주가 바뀌면 예산 객체째 새로 잡히므로 자연히 초기화된다
           }
         : null,
     weeklyBudget: Number.isFinite(p.weeklyBudget) ? cv(p.weeklyBudget) : SEED.weeklyBudget,
@@ -250,8 +251,8 @@ const balanceOf = (d, a) => {
   return Math.round(v);
 };
 
-/* 자동 예산: 다음 입금일까지 하루치를 구하고, 이번 주에 남은 날수만큼만 이번 주 예산으로 잡는다 */
-const budgetBasis = (d, spendBal) => {
+/* 오늘 기준 계산 창 — 다음 입금일까지 남은 일수와 이번 주에 남은 날수 */
+const budgetWindow = (d) => {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const weekly = d.cycleMode === "weekly";
@@ -266,12 +267,29 @@ const budgetBasis = (d, spendBal) => {
   const days = Math.max(1, Math.round((end - today) / 86400000)); // 오늘 포함, 다음 입금일 전날까지
   // 이번 주에 남은 날수(오늘 포함) — 주 시작 설정을 따르고, 남은 일수를 넘지 않는다
   const weekDays = Math.min(days, 7 - ((today.getDay() - d.weekStart + 7) % 7));
+  const last = new Date(end);
+  last.setDate(last.getDate() - 1);
+  return { weekly, days, weekDays, until: toISO(last) };
+};
+
+/* 주 시작 시점 예산: 하루치 × 이번 주에 남은 날수 */
+const budgetBasis = (d, spendBal) => {
+  const { weekly, days, weekDays, until } = budgetWindow(d);
   const amount = weekly
     ? Math.max(0, Math.round(spendBal))
     : Math.max(0, Math.floor(((spendBal / days) * weekDays) / 1000) * 1000);
-  const last = new Date(end);
-  last.setDate(last.getDate() - 1);
-  return { days, weekDays, balance: spendBal, amount, until: toISO(last) };
+  return { days, weekDays, balance: spendBal, amount, until, added: 0 };
+};
+
+/* 주중 유입분은 전체 재계산 없이 증분만 얹는다 —
+   이미 쓴 금액과의 어긋남이 없어 초과 상태가 뒤집히지 않는다 */
+const addInflow = (d, delta) => {
+  if (!d.budget || delta <= 0) return d;
+  const { weekly, days, weekDays } = budgetWindow(d);
+  const raw = d.budget.amount + (delta / days) * weekDays;
+  const amount = weekly ? Math.max(0, Math.round(raw)) : Math.max(0, Math.floor(raw / 1000) * 1000);
+  d.budget = { ...d.budget, amount, added: (d.budget.added || 0) + (amount - d.budget.amount) };
+  return d;
 };
 
 const spendBalance = (d) => {
@@ -279,11 +297,6 @@ const spendBalance = (d) => {
   return s ? balanceOf(d, s) : 0;
 };
 
-/* 이번 주 예산을 지금 잔액으로 다시 확정한다 */
-const refreshBudget = (d) => {
-  d.budget = { week: toISO(startOfWeek(new Date(), d.weekStart)), ...budgetBasis(d, spendBalance(d)) };
-  return d;
-};
 
 /* ── 공용 컴포넌트 ─────────────────────────────────── */
 function Card({ title, right, children }) {
@@ -421,8 +434,8 @@ export default function MoneyBoard() {
     } catch { /* 저장본이 없거나 깨졌으면 시드로 시작 */ }
     const before = spendBalance(d);
     runRules(d); // 앱을 열 때 도래한 고정 항목을 기록으로 만든다
-    // 고정 수입·이체가 쓸돈으로 들어왔으면 이번 주 예산을 바로 다시 잡는다
-    if (d.autoBudget && spendBalance(d) > before) refreshBudget(d);
+    // 고정 수입·이체가 쓸돈으로 들어왔으면 그만큼만 이번 주 예산에 얹는다
+    if (d.autoBudget) addInflow(d, spendBalance(d) - before);
     setData(d);
     loaded.current = true;
   }, []);
@@ -471,7 +484,8 @@ export default function MoneyBoard() {
     setData((prev) => {
       const before = spendBalance(prev);
       const d = fn(structuredClone(prev));
-      if (d.autoBudget && spendBalance(d) > before) refreshBudget(d);
+      const delta = spendBalance(d) - before;
+      if (d.autoBudget && delta > 0) addInflow(d, delta);
       return d;
     });
   const todayISO = toISO(new Date());
@@ -741,6 +755,7 @@ export default function MoneyBoard() {
                   ? `${fmt(data.budget.balance)} 전액`
                   : `${fmt(data.budget.balance)} ÷ ${data.budget.days}일 × ${data.budget.weekDays}일`}
                 {data.budget.until && ` (${md(fromISO(data.budget.until))}까지)`}
+                {data.budget.added > 0 && ` (+${fmt(data.budget.added)} 반영)`}
               </span>
             </Row>
           )}
