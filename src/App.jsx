@@ -19,8 +19,9 @@ const ROLES = {
   spend: { label: "쓸돈" },
   save: { label: "모음" },
   invest: { label: "투자" },
+  pension: { label: "연금" },
 };
-const ROLE_ORDER = ["hub", "spend", "save", "invest"];
+const ROLE_ORDER = ["hub", "spend", "save", "invest", "pension"];
 
 const KEY = "minjun-money-v1";
 
@@ -74,6 +75,14 @@ const dayLabel = (iso) => {
   return `${md(d)} (${WD[d.getDay()]})`;
 };
 const lastDayOf = (y, m) => new Date(y, m + 1, 0).getDate();
+
+/* 계좌 잔액이 어느 시점부터의 기록을 반영하는지 — 기준이 없다시피 하면 '모든 기록' */
+const baseLabel = (ts) => {
+  if (!Number.isFinite(ts) || ts < Date.parse("2020-01-01")) return "모든 기록 반영 중";
+  const d = new Date(ts);
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return `${sameYear ? md(d) : `${d.getFullYear()}. ${md(d)}`} 이후 기록 반영 중`;
+};
 
 function paydayInfo(payday) {
   const now = new Date();
@@ -260,9 +269,13 @@ const normalize = (p) => {
    아직 오지 않은 날짜의 기록은 실제로 빠져나간 돈이 아니므로 세지 않는다 */
 const balanceOf = (d, a) => {
   const today = toISO(new Date());
+  const baseDate = a.baseTs > 0 ? toISO(new Date(a.baseTs)) : "";
   let v = a.baseAmount;
   for (const e of d.entries) {
-    if (e.ts <= a.baseTs || e.date > today) continue;
+    if (e.date > today) continue; // 아직 오지 않은 날짜는 세지 않는다
+    // 기준 시각 뒤에 적었거나, 기준일보다 뒤 날짜인 기록만 반영한다.
+    // 날짜 조건이 없으면 미리 적어둔 예정 기록이 그 날짜가 되어도 잔액에서 누락된다
+    if (e.ts <= a.baseTs && e.date <= baseDate) continue;
     if (e.to === a.id) v += e.amount;
     if (e.from === a.id) v -= e.amount;
   }
@@ -399,6 +412,7 @@ export default function MoneyBoard() {
   const [showFuture, setShowFuture] = useState(false);
   const [menuName, setMenuName] = useState("");
   const [menuPrice, setMenuPrice] = useState("");
+  const [updateReady, setUpdateReady] = useState(false);
   const [pMonth, setPMonth] = useState("");
   const [pAmt, setPAmt] = useState("");
   const [pMemo, setPMemo] = useState("");
@@ -430,6 +444,23 @@ export default function MoneyBoard() {
     }, 600);
     return () => clearTimeout(timer.current);
   }, [data]);
+
+  /* 새 서비스워커가 넘겨받으면 화면의 코드는 아직 옛 버전이다 → 새로고침 배너를 띄운다 */
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const hadController = !!navigator.serviceWorker.controller; // 첫 설치 때는 배너를 띄우지 않는다
+    const onChange = () => { if (hadController) setUpdateReady(true); };
+    navigator.serviceWorker.addEventListener("controllerchange", onChange);
+    const check = () => navigator.serviceWorker.getRegistration().then((r) => r && r.update()).catch(() => {});
+    check();
+    const t = setInterval(check, 60000);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      navigator.serviceWorker.removeEventListener("controllerchange", onChange);
+      document.removeEventListener("visibilitychange", check);
+      clearInterval(t);
+    };
+  }, []);
 
   /* 디바운스(600ms)가 끝나기 전에 앱을 벗어나면 마지막 편집이 사라진다 → 그 자리에서 저장 */
   useEffect(() => {
@@ -498,8 +529,11 @@ export default function MoneyBoard() {
   // 계획대로 쓰면 사이클 끝에 남을 돈 — 목표와의 차이로 앞서는지 뒤처지는지 본다
   const paceDiff = spendBal - todayBudget * pay.days - saveGoal;
 
-  const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
+  const cashTotal = data.accounts
+    .filter((a) => a.role !== "invest" && a.role !== "pension")
+    .reduce((s, a) => s + bal(a), 0);
   const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + bal(a), 0);
+  const pensionTotal = data.accounts.filter((a) => a.role === "pension").reduce((s, a) => s + bal(a), 0);
   const investAcc = data.accounts.find((a) => a.role === "invest");
 
   const cycleStart = new Date(nowD.getFullYear(), nowD.getMonth() - (nowD.getDate() < data.payday ? 1 : 0), data.payday);
@@ -667,10 +701,20 @@ export default function MoneyBoard() {
   };
 
   /* 빠진 자동 반영분을 지금 채운다 (최근 31일) */
-  const catchUp = () =>
+  const catchUp = (ruleId) =>
     setData((prev) => {
       const d = structuredClone(prev);
-      applyRules(d, catchUpWindow());
+      if (ruleId) {
+        // 그 규칙만 채운다 — 나머지는 건드리지 않도록 잠시 떼어 놓는다
+        const keep = d.rules;
+        d.rules = keep.filter((r) => r.id === ruleId);
+        const saveRun = d.autoRunDate;
+        applyRules(d, catchUpWindow());
+        d.rules = keep;
+        d.autoRunDate = saveRun; // 다른 규칙의 도래 판정 기준을 앞당기지 않는다
+      } else {
+        applyRules(d, catchUpWindow());
+      }
       return d;
     });
 
@@ -768,6 +812,14 @@ export default function MoneyBoard() {
   return (
     <div className="min-h-screen pb-14" style={{ background: C.bg, color: C.text }}>
       <div className="max-w-md mx-auto px-4 pt-10 flex flex-col gap-7">
+
+        {updateReady && (
+          <button onClick={() => location.reload()}
+            className="rounded-2xl px-4 py-3 text-[15px] text-left font-medium"
+            style={{ background: C.accent, color: "#fff" }}>
+            업데이트 있음 — 눌러서 새로고침
+          </button>
+        )}
 
         {/* 헤더 */}
         <header className="flex items-start justify-between px-1">
@@ -1016,7 +1068,7 @@ export default function MoneyBoard() {
                 ) : (
                   <>
                     <div className="text-[15px] truncate">{a.name}</div>
-                    {a.note && <div className="text-[13px] truncate" style={{ color: C.sub }}>{a.note}</div>}
+                    <div className="text-[13px] truncate" style={{ color: C.sub }}>{baseLabel(a.baseTs)}</div>
                   </>
                 )}
               </div>
@@ -1041,10 +1093,12 @@ export default function MoneyBoard() {
           <Row>
             <div className="flex-1">
               <div className="text-[13px]" style={{ color: C.sub }}>전체</div>
-              <div className="text-[22px] font-semibold tabular-nums tracking-tight">{fmt(cashTotal + investTotal)}</div>
+              <div className="text-[22px] font-semibold tabular-nums tracking-tight">
+                {fmt(cashTotal + investTotal + pensionTotal)}
+              </div>
             </div>
             <div className="text-right text-[13px] tabular-nums" style={{ color: C.sub }}>
-              현금 {fmt(cashTotal)}<br />투자 {fmt(investTotal)}
+              현금 {fmt(cashTotal)}<br />투자 {fmt(investTotal)}<br />연금 {fmt(pensionTotal)}
             </div>
           </Row>
         </Card>
@@ -1087,7 +1141,13 @@ export default function MoneyBoard() {
                     다음 {info.next ? md(fromISO(info.next)) : "—"} · 마지막 {info.last ? md(fromISO(info.last)) : "—"}
                   </div>
                 </div>
-                {info.pending > 0 && <Tag>밀림 {info.pending}</Tag>}
+                {info.pending > 0 && (
+                  <button onClick={(ev) => { ev.stopPropagation(); catchUp(r.id); }}
+                    className="text-[13px] px-2.5 py-1 rounded-[8px] font-medium shrink-0"
+                    style={{ background: C.accent, color: "#fff" }}>
+                    지금 반영 {info.pending}
+                  </button>
+                )}
                 {!r.active && <Tag>중지</Tag>}
                 <span className="text-[15px] tabular-nums" style={{ color: r.type === "income" ? C.accent : C.text }}>
                   {r.type === "income" ? "+" : r.type === "transfer" ? "→" : "−"}{fmt(r.amount)}
@@ -1309,6 +1369,10 @@ export default function MoneyBoard() {
         )}
 
         </>)}
+
+        <div className="px-4 text-[12px] tabular-nums" style={{ color: C.sub }}>
+          {__BUILD_COMMIT__} · {new Date(__BUILD_TIME__).toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" })}
+        </div>
 
         <footer className="flex items-center justify-between px-4 text-[13px]" style={{ color: C.sub }}>
           <span>{saveState || "적으면 자동 저장"}</span>

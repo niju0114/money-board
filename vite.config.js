@@ -1,10 +1,25 @@
+import { execSync } from "node:child_process";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { VitePWA } from "vite-plugin-pwa";
 
+/* 화면에서 어느 버전인지 바로 보이도록 빌드 스탬프를 주입한다 */
+const commit = (() => {
+  try {
+    return execSync("git rev-parse --short=7 HEAD").toString().trim();
+  } catch {
+    return "unknown";
+  }
+})();
+const builtAt = new Date().toISOString();
+
 export default defineConfig({
   base: "/money-board/",
+  define: {
+    __BUILD_COMMIT__: JSON.stringify(commit),
+    __BUILD_TIME__: JSON.stringify(builtAt)
+  },
   plugins: [
     react(),
     tailwindcss(),
@@ -14,7 +29,7 @@ export default defineConfig({
         id: "/money-board/",
         name: "민준의 돈",
         short_name: "민준의 돈",
-        description: "개인 원장 — 주간 예산·가계부·계좌를 한 화면에",
+        description: "개인 원장 — 하루 예산·가계부·계좌를 한 화면에",
         lang: "ko",
         start_url: "/money-board/",
         scope: "/money-board/",
@@ -28,7 +43,11 @@ export default defineConfig({
         ]
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,svg,png,ico,woff2}"]
+        globPatterns: ["**/*.{js,css,html,svg,png,ico,woff2}"],
+        // 새 버전을 기다리지 않고 바로 넘긴다 — 폰에 옛 화면이 남는 걸 막는다
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true
       }
     })
   ]
