@@ -26,14 +26,10 @@ const KEY = "minjun-money-v1";
 
 /* 공개 저장소에 올라가므로 시드에는 개인 금액·항목을 두지 않는다 */
 const SEED = {
-  v: 9,
+  v: 10,
   unit: "won",
   payday: 25,
-  cycleMode: "auto", // 생활비 입금 주기: auto | weekly | payday
-  weekStart: 0, // 주 시작 요일: 0=일, 1=월
-  autoBudget: true,
-  budget: null,
-  weeklyBudget: 100000, // 수동 모드에서 쓰는 값
+  weekStart: 0, // 주 시작 요일 — 가계부 묶음에만 쓴다 (0=일, 1=월)
   accounts: [
     { id: "a1", name: "주계좌", note: "수입이 들어오는 곳", baseAmount: 0, baseTs: 0, role: "hub" },
     { id: "a2", name: "세이프박스", note: "일정 없이 꺼내 쓰는 돈", baseAmount: 0, baseTs: 0, role: "save" },
@@ -97,23 +93,8 @@ const ruleHitsOn = (rule, d) => {
   return d.getDate() === Math.min(rule.freq.day, last);
 };
 
-/* '쓸돈' 계좌로 매주 들어오는 활성 고정 항목이 있으면 생활비를 매주 받는 것으로 본다 */
-const hasWeeklyInflow = (d) => {
-  const spend = d.accounts.find((a) => a.role === "spend");
-  const today = toISO(new Date());
-  return (
-    !!spend &&
-    d.rules.some(
-      (r) =>
-        r.active &&
-        r.freq.kind === "weekly" &&
-        r.to === spend.id &&
-        (r.type === "income" || r.type === "transfer") &&
-        (!r.startDate || r.startDate <= today) // 아직 시작 전인 규칙은 세지 않는다
-    )
-  );
-};
-const effectiveCycle = (d) => (d.cycleMode === "auto" ? (hasWeeklyInflow(d) ? "weekly" : "payday") : d.cycleMode);
+/* 하루 예산 분모의 하한 — 사이클 막바지에 하루 예산이 폭등하지 않게 한다 */
+const MIN_SPREAD_DAYS = 5;
 
 const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
@@ -221,28 +202,11 @@ const normalize = (p) => {
   });
 
   return {
-    v: 9,
+    // v10: 주간 예산 배분 레이어 제거 — cycleMode·autoBudget·budget·weeklyBudget은 버린다
+    v: 10,
     unit: "won",
     payday: Number.isFinite(p.payday) ? p.payday : SEED.payday,
-    // v9부터 자동 판정이 기본 — 그 전 저장본의 값은 앱 기본값이었을 뿐이라 auto로 넘긴다
-    cycleMode:
-      Number(p.v) >= 9 && (p.cycleMode === "weekly" || p.cycleMode === "payday") ? p.cycleMode : "auto",
     weekStart: p.weekStart === 1 ? 1 : 0,
-    autoBudget: typeof p.autoBudget === "boolean" ? p.autoBudget : true,
-    // weekDays가 없으면 주 단위로 계산하던 옛 예산 → 버리고 새 방식으로 다시 잡게 둔다
-    budget:
-      p.budget && typeof p.budget.week === "string" && Number.isFinite(p.budget.weekDays)
-        ? {
-            week: p.budget.week,
-            amount: cv(p.budget.amount),
-            balance: cv(p.budget.balance),
-            days: Number(p.budget.days) || 1,
-            weekDays: Number(p.budget.weekDays) || 1,
-            until: typeof p.budget.until === "string" ? p.budget.until : null,
-            added: Math.max(0, cv(p.budget.added)), // 주가 바뀌면 예산 객체째 새로 잡히므로 자연히 초기화된다
-          }
-        : null,
-    weeklyBudget: Number.isFinite(p.weeklyBudget) ? cv(p.weeklyBudget) : SEED.weeklyBudget,
     accounts,
     entries,
     rules: Array.isArray(p.rules)
@@ -297,52 +261,10 @@ const balanceOf = (d, a) => {
   return Math.round(v);
 };
 
-/* 오늘 기준 계산 창 — 다음 입금일까지 남은 일수와 이번 주에 남은 날수 */
-const budgetWindow = (d) => {
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const weekly = effectiveCycle(d) === "weekly";
-  let end;
-  if (weekly) {
-    end = startOfWeek(today, d.weekStart);
-    end.setDate(end.getDate() + 7);
-  } else {
-    end = new Date(today.getFullYear(), today.getMonth(), d.payday);
-    if (today.getDate() >= d.payday) end.setMonth(end.getMonth() + 1);
-  }
-  const days = Math.max(1, Math.round((end - today) / 86400000)); // 오늘 포함, 다음 입금일 전날까지
-  // 이번 주에 남은 날수(오늘 포함) — 주 시작 설정을 따르고, 남은 일수를 넘지 않는다
-  const weekDays = Math.min(days, 7 - ((today.getDay() - d.weekStart + 7) % 7));
-  const last = new Date(end);
-  last.setDate(last.getDate() - 1);
-  return { weekly, days, weekDays, until: toISO(last) };
-};
-
-/* 주 시작 시점 예산: 하루치 × 이번 주에 남은 날수 */
-const budgetBasis = (d, spendBal) => {
-  const { weekly, days, weekDays, until } = budgetWindow(d);
-  const amount = weekly
-    ? Math.max(0, Math.round(spendBal))
-    : Math.max(0, Math.floor(((spendBal / days) * weekDays) / 1000) * 1000);
-  return { days, weekDays, balance: spendBal, amount, until, added: 0 };
-};
-
-/* 주중 유입분은 전체 재계산 없이 증분만 얹는다 —
-   이미 쓴 금액과의 어긋남이 없어 초과 상태가 뒤집히지 않는다 */
-const addInflow = (d, delta) => {
-  if (!d.budget || delta <= 0) return d;
-  const { weekly, days, weekDays } = budgetWindow(d);
-  const raw = d.budget.amount + (delta / days) * weekDays;
-  const amount = weekly ? Math.max(0, Math.round(raw)) : Math.max(0, Math.floor(raw / 1000) * 1000);
-  d.budget = { ...d.budget, amount, added: (d.budget.added || 0) + (amount - d.budget.amount) };
-  return d;
-};
-
-const spendBalance = (d) => {
-  const s = d.accounts.find((a) => a.role === "spend");
-  return s ? balanceOf(d, s) : 0;
-};
-
+/* 하루 예산 = 쓸돈 잔액 ÷ 다음 급여일까지 남은 일수(오늘 포함).
+   분모에 하한을 둬서 사이클 막바지에 하루 예산이 폭등하지 않게 한다 —
+   남은 잔액은 자연스럽게 다음 사이클로 이월된다. 표시는 100원 단위 내림. */
+const perDayFrom = (base, days) => Math.max(0, Math.floor(base / Math.max(MIN_SPREAD_DAYS, days) / 100) * 100);
 
 /* ── 공용 컴포넌트 ─────────────────────────────────── */
 function Card({ title, right, children }) {
@@ -479,10 +401,7 @@ export default function MoneyBoard() {
       const r = localStorage.getItem(KEY);
       if (r) d = normalize(JSON.parse(r));
     } catch { /* 저장본이 없거나 깨졌으면 시드로 시작 */ }
-    const before = spendBalance(d);
     runRules(d); // 앱을 열 때 도래한 고정 항목을 기록으로 만든다
-    // 고정 수입·이체가 쓸돈으로 들어왔으면 그만큼만 이번 주 예산에 얹는다
-    if (d.autoBudget) addInflow(d, spendBalance(d) - before);
     setData(d);
     loaded.current = true;
   }, []);
@@ -519,19 +438,6 @@ export default function MoneyBoard() {
     };
   }, [data]);
 
-  /* 주가 바뀌면 그 주의 예산을 한 번 확정하고, 주중에는 건드리지 않는다 */
-  useEffect(() => {
-    if (!loaded.current || !data || !data.autoBudget) return;
-    const wk = toISO(startOfWeek(new Date(), data.weekStart));
-    if (data.budget && data.budget.week === wk) return;
-    setData((prev) => {
-      const d = structuredClone(prev);
-      const spend = d.accounts.find((a) => a.role === "spend");
-      d.budget = { week: wk, ...budgetBasis(d, spend ? balanceOf(d, spend) : 0) };
-      return d;
-    });
-  }, [data]);
-
   if (!data)
     return (
       <div className="min-h-screen flex items-center justify-center text-[15px]" style={{ color: C.sub }}>
@@ -542,16 +448,7 @@ export default function MoneyBoard() {
   /* ── 파생값 ── */
   const up = (fn) => setData((d) => fn(structuredClone(d)));
 
-  /* 기록을 건드릴 때 쓴다 — 쓸돈 잔액이 늘어난 경우에만 이번 주 예산을 다시 잡고,
-     지출로 줄어든 경우에는 주중 고정을 유지한다 */
-  const upEntries = (fn) =>
-    setData((prev) => {
-      const before = spendBalance(prev);
-      const d = fn(structuredClone(prev));
-      const delta = spendBalance(d) - before;
-      if (d.autoBudget && delta > 0) addInflow(d, delta);
-      return d;
-    });
+  const upEntries = up; // 하루 예산은 잔액에서 바로 나오므로 따로 손볼 게 없다
   const todayISO = toISO(new Date());
   const nowD = new Date();
   const sow = (d) => startOfWeek(d, data.weekStart);
@@ -562,32 +459,27 @@ export default function MoneyBoard() {
   const acct = (id) => data.accounts.find((a) => a.id === id);
   const acctName = (id) => acct(id)?.name ?? "—";
   const spendAcc = data.accounts.find((a) => a.role === "spend");
-  const cycle = effectiveCycle(data);
-
-  const budget = data.autoBudget ? data.budget?.amount ?? 0 : data.weeklyBudget;
   // 아직 오지 않은 날짜의 기록은 현재 집계에 넣지 않는다 (예정 기록)
   const isPast = (e) => e.date <= todayISO;
-  // 주간 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
+  // 하루 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
   const fromSpend = (e) => e.type === "expense" && spendAcc && e.from === spendAcc.id;
+  const spentOn = (iso) => data.entries.filter((e) => fromSpend(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
   const weekSpent = data.entries
     .filter((e) => fromSpend(e) && isPast(e) && inThisWeek(e.date))
     .reduce((s, e) => s + e.amount, 0);
-  const remaining = Math.round(budget - weekSpent);
-  const over = remaining < 0;
-  const daysLeftWeek = 7 - ((nowD.getDay() - data.weekStart + 7) % 7); // 오늘 포함
 
-  /* 오늘 예산 — 오늘 이전 지출만 반영하므로 하루 안에서는 고정된다 */
-  const spentOn = (iso) => data.entries.filter((e) => fromSpend(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
-  const weekSpentBefore = data.entries
-    .filter((e) => fromSpend(e) && inThisWeek(e.date) && e.date < todayISO)
-    .reduce((s, e) => s + e.amount, 0);
+  const pay = paydayInfo(data.payday); // 오늘 포함, 다음 급여일까지 남은 일수
+  const spendBal = spendAcc ? bal(spendAcc) : 0;
   const todaySpent = spentOn(todayISO);
-  const todayBudget = Math.max(0, Math.floor((budget - weekSpentBefore) / daysLeftWeek));
+  // 오늘 지출은 분자에서 되돌려 하루 시작 시점 값으로 고정한다 —
+  // 오늘 쓸수록 오늘 예산 자체가 줄어드는 일을 막는다
+  const dayBase = spendBal + todaySpent;
+  const spreadDays = Math.max(MIN_SPREAD_DAYS, pay.days);
+  const todayBudget = perDayFrom(dayBase, pay.days);
   const todayLeft = todayBudget - todaySpent;
   const overToday = todayLeft < 0;
-  // 지금 멈추면 내일 예산이 얼마가 되는지 (주 마지막 날이면 다음 주가 새로 잡히므로 없음)
-  const tomorrowBudget =
-    daysLeftWeek > 1 ? Math.max(0, Math.floor((budget - weekSpentBefore - todaySpent) / (daysLeftWeek - 1))) : null;
+  // 지금 멈추면 내일 예산 — 오늘 끝 잔액을 하루 줄어든 날수로 나눈다
+  const tomorrowBudget = perDayFrom(spendBal, pay.days - 1);
 
   const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
   const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + bal(a), 0);
@@ -607,7 +499,7 @@ export default function MoneyBoard() {
 
   /* 아낀 돈 — 저장하지 않고 매번 다시 구한다.
      지난 날들의 (그날 예산 − 그날 지출) 합이라 초과한 날은 음수로 상계된다 */
-  const dailyRef = budget / 7;
+  const dailyRef = todayBudget;
   let savedRaw = 0;
   for (let day = startOfDay(cycleStart), g = 0; g < 45 && day < startOfDay(nowD); g++, day = addDays(day, 1)) {
     savedRaw += dailyRef - spentOn(toISO(day));
@@ -617,8 +509,6 @@ export default function MoneyBoard() {
     .filter((e) => e.type === "transfer" && e.savedFrom && isPast(e) && inCycle(e.date))
     .reduce((s, e) => s + e.amount, 0);
   const saved = Math.round(savedRaw) - sentSaved;
-
-  const pay = paydayInfo(data.payday);
 
   /* 모이는 돈 — 올해 12월 말까지 */
   const curY = nowD.getFullYear(), curM = nowD.getMonth();
@@ -724,16 +614,11 @@ export default function MoneyBoard() {
     freq: { kind: "monthly", day: 1 }, startDate: todayISO, active: true, isNew: true,
   });
 
-  /* 고정 항목이 바뀌면: 오늘 도래분을 그 자리에서 반영하고,
-     입금 주기 자동 판정이 뒤집혔으면 예산을 다시 잡는다 */
+  /* 고정 항목이 바뀌면 오늘 도래분을 그 자리에서 반영한다 */
   const upRules = (fn) =>
     setData((prev) => {
-      const beforeCycle = effectiveCycle(prev);
-      const beforeBal = spendBalance(prev);
       const d = fn(structuredClone(prev));
       runRules(d); // 오늘 등록한 규칙이 오늘 도래분이면 새로고침 없이 바로 기록된다
-      if (effectiveCycle(d) !== beforeCycle) d.budget = null;
-      else if (d.autoBudget) addInflow(d, spendBalance(d) - beforeBal);
       return d;
     });
 
@@ -756,10 +641,8 @@ export default function MoneyBoard() {
   /* 빠진 자동 반영분을 지금 채운다 (최근 31일) */
   const catchUp = () =>
     setData((prev) => {
-      const beforeBal = spendBalance(prev);
       const d = structuredClone(prev);
       applyRules(d, catchUpWindow());
-      if (d.autoBudget) addInflow(d, spendBalance(d) - beforeBal);
       return d;
     });
 
@@ -907,13 +790,11 @@ export default function MoneyBoard() {
               {overToday
                 ? `${fmt(-todayLeft)} 초과 · 내일 예산에 반영돼요`
                 : todaySpent > 0
-                ? tomorrowBudget != null
-                  ? `지금 그만두면 내일 ${fmt(tomorrowBudget)}원`
-                  : "내일부터 새 주 예산이 시작돼요"
+                ? `지금 그만두면 내일 ${fmt(tomorrowBudget)}원`
                 : "오늘 안 쓴 만큼 내일 예산이 늘어나요"}
             </div>
             <div className="text-[13px] mt-1" style={{ color: C.sub }}>
-              이번 주 남은 {fmt(remaining)} · 주간 예산 {fmt(budget)} · 남은 {daysLeftWeek}일
+              쓸돈 {fmt(spendBal)} · 급여일까지 {pay.days}일 · 하루 {fmt(todayBudget)}
             </div>
           </div>
 
@@ -964,47 +845,26 @@ export default function MoneyBoard() {
         {tab === "manage" && (<>
 
         {/* 예산 */}
-        <Card
-          title={`주간 예산 · ${data.weekStart === 1 ? "월" : "일"}요일 시작`}
-          right={<Seg options={[[true, "자동"], [false, "수동"]]} value={data.autoBudget}
-            onChange={(k) => up((d) => { d.autoBudget = k; if (k) d.budget = null; return d; })} />}
-        >
+        <Card title="하루 예산">
           <Row first>
-            <span className="text-[15px] flex-1">이번 주 예산</span>
-            {data.autoBudget
-              ? <span className="text-[15px] tabular-nums">{fmt(budget)}</span>
-              : <Amount value={data.weeklyBudget} className="text-[15px]"
-                  onCommit={(n) => up((d) => { d.weeklyBudget = n; return d; })} />}
+            <span className="text-[15px] flex-1">오늘 예산</span>
+            <span className="text-[15px] tabular-nums">{fmt(todayBudget)}</span>
           </Row>
-          {data.autoBudget && data.budget && (
-            <Row align="items-start">
-              <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산 근거</span>
-              <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
-                {cycle === "weekly"
-                  ? `${fmt(data.budget.balance)} 전액`
-                  : `${fmt(data.budget.balance)} ÷ ${data.budget.days}일 × ${data.budget.weekDays}일`}
-                {data.budget.until && ` (${md(fromISO(data.budget.until))}까지)`}
-                {data.budget.added > 0 && ` (+${fmt(data.budget.added)} 반영)`}
-              </span>
-            </Row>
-          )}
+          <Row align="items-start">
+            <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산 근거</span>
+            <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
+              {fmt(dayBase)} ÷ {spreadDays}일 = 하루 {fmt(todayBudget)}
+              {spreadDays !== pay.days && ` (최소 ${MIN_SPREAD_DAYS}일로 폄)`}
+            </span>
+          </Row>
           <Row>
-            <span className="text-[15px] flex-1">입금 주기</span>
-            <Seg options={[["auto", "자동"], ["weekly", "매주"], ["payday", "급여일"]]} value={data.cycleMode}
-              onChange={(k) => up((d) => { d.cycleMode = k; d.budget = null; return d; })} />
+            <span className="text-[13px] flex-1" style={{ color: C.sub }}>다음 입금</span>
+            <span className="text-[13px]" style={{ color: C.sub }}>{pay.label} · {pay.days}일 남음</span>
           </Row>
-          {data.cycleMode === "auto" && (
-            <Row>
-              <span className="text-[13px] flex-1" style={{ color: C.sub }}>자동 판정</span>
-              <span className="text-[13px]" style={{ color: C.sub }}>
-                {cycle === "weekly" ? "매주 — 쓸돈으로 들어오는 매주 고정 항목 있음" : "급여일마다"}
-              </span>
-            </Row>
-          )}
           <Row>
             <span className="text-[15px] flex-1">주 시작</span>
             <Seg options={[[0, "일"], [1, "월"]]} value={data.weekStart}
-              onChange={(k) => up((d) => { d.weekStart = k; d.budget = null; return d; })} />
+              onChange={(k) => up((d) => { d.weekStart = k; return d; })} />
           </Row>
           <Row align="items-start">
             <span className="text-[13px] shrink-0" style={{ color: C.sub }}>
@@ -1218,9 +1078,7 @@ export default function MoneyBoard() {
         <Card title="가계부">
           <Row first>
             <span className="text-[13px] flex-1" style={{ color: C.sub }}>이번 주</span>
-            <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>
-              {fmt(weekSpent)} / 예산 {fmt(budget)}
-            </span>
+            <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>{fmt(weekSpent)}</span>
           </Row>
           {pastDates.length === 0 && futureEntries.length === 0 && (
             <Row><span className="text-[15px]" style={{ color: C.sub }}>아직 기록이 없어요.</span></Row>
