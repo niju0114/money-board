@@ -43,6 +43,7 @@ const SEED = {
   entries: [],
   rules: [],
   autoRunDate: null,
+  lastAuto: null, // { date, count } — 마지막 자동 반영 결과
   planned: [],
   goal: { monthly: 0 },
   routine: "",
@@ -108,24 +109,30 @@ const hasWeeklyInflow = (d) => {
 };
 const effectiveCycle = (d) => (d.cycleMode === "auto" ? (hasWeeklyInflow(d) ? "weekly" : "payday") : d.cycleMode);
 
-/* 마지막 실행일부터 오늘까지 도래한 규칙을 기록으로 만든다 (미래 생성 없음, 중복 없음) */
-const runRules = (d) => {
-  const todayI = toISO(new Date());
-  if (!d.autoRunDate) {
-    d.autoRunDate = todayI; // 첫 실행 — 과거를 소급 생성하지 않는다
-    return 0;
+const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+/* 규칙이 [from, to] 사이에 도래하는 날짜 중 아직 기록되지 않은 것 (오늘까지만) */
+const pendingDates = (d, rule, from, to) => {
+  if (!rule.active) return [];
+  const seen = new Set(d.entries.filter((e) => e.ruleId === rule.id).map((e) => e.date));
+  const out = [];
+  const day = startOfDay(from);
+  const end = startOfDay(to);
+  for (let g = 0; g < 400 && day <= end; g++, day.setDate(day.getDate() + 1)) {
+    const iso = toISO(day);
+    if (ruleHitsOn(rule, day) && !seen.has(iso)) out.push(iso);
   }
-  const seen = new Set(d.entries.filter((e) => e.ruleId).map((e) => `${e.ruleId}@${e.date}`));
-  const day = fromISO(d.autoRunDate);
+  return out;
+};
+
+/* from(포함)부터 오늘까지 도래한 규칙을 기록으로 만든다 — 미래 생성 없음, 중복 없음 */
+const applyRules = (d, from) => {
+  const today = startOfDay(new Date());
   const ts = Date.now();
   let made = 0;
-  for (let guard = 0; guard < 400 && toISO(day) <= todayI; guard++, day.setDate(day.getDate() + 1)) {
-    const iso = toISO(day);
-    for (const r of d.rules) {
-      if (!r.active || !ruleHitsOn(r, day)) continue;
-      const k = `${r.id}@${iso}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
+  for (const r of d.rules) {
+    for (const iso of pendingDates(d, r, from, today)) {
       d.entries.unshift({
         id: uid(),
         ts: ts + made, // 기록 시점 기준 — 직접 입력한 기록과 같은 규칙으로 잔액에 반영된다
@@ -144,10 +151,17 @@ const runRules = (d) => {
   if (made) {
     d.entries.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.ts - a.ts));
     d.entries = d.entries.slice(0, 500);
+    d.lastAuto = { date: toISO(today), count: made };
   }
-  d.autoRunDate = todayI;
+  d.autoRunDate = toISO(today);
   return made;
 };
+
+/* 앱을 열 때 — 마지막 실행일부터. 첫 실행이면 오늘 하루만 본다(과거 소급 없음) */
+const runRules = (d) => applyRules(d, d.autoRunDate ? fromISO(d.autoRunDate) : startOfDay(new Date()));
+
+/* 수동 '지금 반영' — 최근 31일까지 거슬러 빠진 것을 채운다 */
+const catchUpWindow = () => addDays(startOfDay(new Date()), -31);
 
 /* ── 저장본 정규화 ─────────────────────────────────── */
 const normalize = (p) => {
@@ -196,6 +210,7 @@ const normalize = (p) => {
       to: type === "expense" ? null : to,
       auto: e.auto === true,
       ruleId: e.ruleId ?? null,
+      savedFrom: e.savedFrom === true, // '아낀 돈 → 투자'로 보낸 이체 표시
     };
   });
 
@@ -230,8 +245,9 @@ const normalize = (p) => {
           name: r.name ?? "고정 항목",
           amount: cv(r.amount),
           type: r.type === "income" || r.type === "transfer" ? r.type : "expense",
-          from: r.from ?? null,
-          to: r.to ?? null,
+          // 규칙이 비었거나 지워진 계좌를 가리키면 자동 생성분이 잔액에 안 붙는다 → 실재 계좌로 보정
+          from: r.type === "income" ? null : live(r.from, spendId ?? firstId),
+          to: r.type === "expense" ? null : live(r.to, hubId),
           freq:
             r.freq?.kind === "weekly"
               ? { kind: "weekly", dow: Math.min(6, Math.max(0, Number(r.freq.dow) || 0)) }
@@ -243,6 +259,10 @@ const normalize = (p) => {
         }))
       : [],
     autoRunDate: typeof p.autoRunDate === "string" ? p.autoRunDate : null,
+    lastAuto:
+      p.lastAuto && typeof p.lastAuto.date === "string"
+        ? { date: p.lastAuto.date, count: Number(p.lastAuto.count) || 0 }
+        : null,
     planned: Array.isArray(p.planned)
       ? p.planned.map((x) => ({
           id: x.id ?? uid(),
@@ -436,6 +456,8 @@ export default function MoneyBoard() {
   const [eTo, setETo] = useState("");
   const [entryEdit, setEntryEdit] = useState(null);
   const [ruleEdit, setRuleEdit] = useState(null);
+  const [showSend, setShowSend] = useState(false);
+  const [sendAmt, setSendAmt] = useState("");
   const [pMonth, setPMonth] = useState("");
   const [pAmt, setPAmt] = useState("");
   const [pMemo, setPMemo] = useState("");
@@ -523,12 +545,23 @@ export default function MoneyBoard() {
   const remaining = Math.round(budget - weekSpent);
   const over = remaining < 0;
   const daysLeftWeek = 7 - ((nowD.getDay() - data.weekStart + 7) % 7); // 오늘 포함
-  // '하루 N꼴'은 저장된 일일 단가를 쓰지 않고 매 렌더에서 다시 구한다 —
-  // 주중에 예산이 증분으로 오르면 남은 돈과 같은 렌더에서 함께 움직인다
-  const perDay = Math.max(remaining, 0) / daysLeftWeek;
+
+  /* 오늘 예산 — 오늘 이전 지출만 반영하므로 하루 안에서는 고정된다 */
+  const spentOn = (iso) => data.entries.filter((e) => fromSpend(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
+  const weekSpentBefore = data.entries
+    .filter((e) => fromSpend(e) && inThisWeek(e.date) && e.date < todayISO)
+    .reduce((s, e) => s + e.amount, 0);
+  const todaySpent = spentOn(todayISO);
+  const todayBudget = Math.max(0, Math.floor((budget - weekSpentBefore) / daysLeftWeek));
+  const todayLeft = todayBudget - todaySpent;
+  const overToday = todayLeft < 0;
+  // 지금 멈추면 내일 예산이 얼마가 되는지 (주 마지막 날이면 다음 주가 새로 잡히므로 없음)
+  const tomorrowBudget =
+    daysLeftWeek > 1 ? Math.max(0, Math.floor((budget - weekSpentBefore - todaySpent) / (daysLeftWeek - 1))) : null;
 
   const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
   const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + bal(a), 0);
+  const investAcc = data.accounts.find((a) => a.role === "invest");
 
   const cycleStart = new Date(nowD.getFullYear(), nowD.getMonth() - (nowD.getDate() < data.payday ? 1 : 0), data.payday);
   const cycleEnd = new Date(cycleStart.getFullYear(), cycleStart.getMonth() + 1, data.payday);
@@ -537,6 +570,18 @@ export default function MoneyBoard() {
   const inCycle = (iso) => iso >= toISO(cycleStart) && iso < toISO(cycleEnd);
   const cycleSpend = data.entries.filter((e) => fromSpend(e) && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
   const cycleAll = data.entries.filter((e) => e.type === "expense" && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
+
+  /* 이번 사이클에서 아낀 돈 — 지난 날들의 (그날 예산 − 그날 지출) 합 */
+  const dailyRef = budget / 7;
+  let savedRaw = 0;
+  for (let day = startOfDay(cycleStart), g = 0; g < 45 && day < startOfDay(nowD); g++, day = addDays(day, 1)) {
+    savedRaw += dailyRef - spentOn(toISO(day));
+  }
+  // 이미 투자로 보낸 몫은 빼고 남은 것만 보여준다
+  const sentSaved = data.entries
+    .filter((e) => e.type === "transfer" && e.savedFrom && inCycle(e.date))
+    .reduce((s, e) => s + e.amount, 0);
+  const saved = Math.max(0, Math.round(savedRaw) - sentSaved);
 
   const pay = paydayInfo(data.payday);
 
@@ -550,6 +595,19 @@ export default function MoneyBoard() {
   });
   const plannedTotal = data.planned.reduce((s, p) => s + p.amount, 0);
   const goalTotal = investTotal + data.goal.monthly * monthsToDec + plannedUpTo(12);
+
+  /* 고정 항목별 상태 — 다음 실행일 / 마지막 반영일 / 밀린 건수 */
+  const ruleInfo = (r) => {
+    const done = data.entries.filter((e) => e.ruleId === r.id).map((e) => e.date).sort();
+    const pending = pendingDates(data, r, catchUpWindow(), nowD);
+    let next = null;
+    for (let i = 0, day = startOfDay(nowD); i < 400; i++, day = addDays(day, 1)) {
+      const iso = toISO(day);
+      if (ruleHitsOn(r, day) && !done.includes(iso)) { next = iso; break; }
+    }
+    return { next, last: done.length ? done[done.length - 1] : null, pending: pending.length };
+  };
+  const pendingTotal = data.rules.reduce((s, r) => s + pendingDates(data, r, catchUpWindow(), nowD).length, 0);
 
   /* 다가오는 고정 항목 — 앞으로 14일 */
   const madeKeys = new Set(data.entries.filter((e) => e.ruleId).map((e) => `${e.ruleId}@${e.date}`));
@@ -631,12 +689,42 @@ export default function MoneyBoard() {
     freq: { kind: "monthly", day: 1 }, startDate: todayISO, active: true, isNew: true,
   });
 
-  /* 고정 항목이 바뀌면 입금 주기 자동 판정이 뒤집힐 수 있어, 그때는 예산을 다시 잡는다 */
+  /* 고정 항목이 바뀌면: 오늘 도래분을 그 자리에서 반영하고,
+     입금 주기 자동 판정이 뒤집혔으면 예산을 다시 잡는다 */
   const upRules = (fn) =>
     setData((prev) => {
-      const before = effectiveCycle(prev);
+      const beforeCycle = effectiveCycle(prev);
+      const beforeBal = spendBalance(prev);
       const d = fn(structuredClone(prev));
-      if (effectiveCycle(d) !== before) d.budget = null;
+      runRules(d); // 오늘 등록한 규칙이 오늘 도래분이면 새로고침 없이 바로 기록된다
+      if (effectiveCycle(d) !== beforeCycle) d.budget = null;
+      else if (d.autoBudget) addInflow(d, spendBalance(d) - beforeBal);
+      return d;
+    });
+
+  /* 아낀 돈을 투자 계좌로 보낸다 */
+  const sendSaved = () => {
+    const n = parseWon(sendAmt);
+    if (!n || n <= 0 || !spendAcc || !investAcc) return;
+    upEntries((d) => {
+      d.entries.unshift({
+        id: uid(), ts: Date.now(), date: todayISO, type: "transfer", amount: n,
+        text: "아낀 돈 → 투자", from: spendAcc.id, to: investAcc.id,
+        auto: false, ruleId: null, savedFrom: true,
+      });
+      d.entries = d.entries.slice(0, 500);
+      return d;
+    });
+    setSendAmt(""); setShowSend(false);
+  };
+
+  /* 빠진 자동 반영분을 지금 채운다 (최근 31일) */
+  const catchUp = () =>
+    setData((prev) => {
+      const beforeBal = spendBalance(prev);
+      const d = structuredClone(prev);
+      applyRules(d, catchUpWindow());
+      if (d.autoBudget) addInflow(d, spendBalance(d) - beforeBal);
       return d;
     });
 
@@ -722,32 +810,82 @@ export default function MoneyBoard() {
 
         {tab === "daily" && (<>
 
-        {/* 이번 주 */}
-        <Card
-          title={`이번 주 · ${data.weekStart === 1 ? "월" : "일"}요일 시작`}
-          right={<Seg options={[[true, "자동"], [false, "수동"]]} value={data.autoBudget}
-            onChange={(k) => up((d) => { d.autoBudget = k; if (k) d.budget = null; return d; })} />}
-        >
+        {/* 오늘 */}
+        <Card title="오늘">
           <div className="pt-3 pb-1">
-            <div className="text-[13px]" style={{ color: C.sub }}>남은 돈</div>
+            <div className="text-[13px]" style={{ color: C.sub }}>오늘 쓸 수 있는 돈</div>
             <div className="text-[40px] leading-none font-semibold tabular-nums tracking-tight mt-1"
-              style={{ color: over ? C.danger : C.text }}>
-              {fmt(remaining)}
+              style={{ color: overToday ? C.danger : C.text }}>
+              {fmt(todayLeft)}
             </div>
             <div className="text-[13px] mt-2" style={{ color: C.sub }}>
-              {over
-                ? `${fmt(-remaining)} 초과 · 이번 주 ${fmt(weekSpent)} 씀`
-                : `남은 ${daysLeftWeek}일 · 하루 ${fmt(perDay)}꼴`}
+              {overToday
+                ? `${fmt(-todayLeft)} 초과 · 내일 예산에 반영돼요`
+                : todaySpent > 0
+                ? tomorrowBudget != null
+                  ? `지금 그만두면 내일 ${fmt(tomorrowBudget)}원`
+                  : "내일부터 새 주 예산이 시작돼요"
+                : "오늘 안 쓴 만큼 내일 예산이 늘어나요"}
             </div>
-            <div className="h-[3px] rounded-full mt-3 overflow-hidden" style={{ background: C.fill }}>
-              <div className="h-full rounded-full"
-                style={{ width: `${Math.min(100, Math.max(0, (weekSpent / Math.max(budget, 1)) * 100))}%`,
-                  background: over ? C.danger : C.accent }} />
+            <div className="text-[13px] mt-1" style={{ color: C.sub }}>
+              이번 주 남은 {fmt(remaining)} · 주간 예산 {fmt(budget)}
             </div>
           </div>
 
+          {/* 입력 — 한 줄 */}
+          <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
+            <div className="flex flex-wrap items-center gap-2">
+              <Seg options={[["expense", "지출"], ["income", "수입"], ["transfer", "이체"]]} value={eKind} onChange={setEKind} />
+              <Field value={eAmt} onChange={(e) => setEAmt(e.target.value)} placeholder="금액" inputMode="decimal"
+                onKeyDown={(e) => e.key === "Enter" && addEntry()} className="w-24 tabular-nums" />
+              <Field value={eText} onChange={(e) => setEText(e.target.value)}
+                placeholder={eKind === "income" ? "월급" : eKind === "transfer" ? "이체" : "점심"}
+                onKeyDown={(e) => e.key === "Enter" && addEntry()} className="flex-1 min-w-[80px]" />
+              <Field type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className="text-[13px]" />
+              {eKind !== "income" && <AcctSelect value={fromId} onChange={setEFrom} />}
+              {eKind !== "expense" && <AcctSelect value={toId} onChange={setETo} />}
+              <button onClick={addEntry}
+                className="ml-auto text-[15px] px-4 py-2 rounded-[10px] font-medium"
+                style={{ background: C.accent, color: "#fff" }}>
+                적기
+              </button>
+            </div>
+          </div>
+
+          {/* 아낀 돈 */}
           <Row>
-            <span className="text-[15px] flex-1">주간 예산</span>
+            <span className="text-[13px] flex-1" style={{ color: C.sub }}>
+              이번 사이클 아낀 돈 <span className="tabular-nums" style={{ color: C.text }}>{fmt(saved)}</span>
+            </span>
+            {saved > 0 && investAcc && spendAcc && !showSend && (
+              <button onClick={() => { setSendAmt(String(saved)); setShowSend(true); }}
+                className="text-[13px]" style={{ color: C.accent }}>투자로 보내기</button>
+            )}
+          </Row>
+          {showSend && (
+            <Row>
+              <Field autoFocus value={sendAmt} onChange={(e) => setSendAmt(e.target.value)} inputMode="decimal"
+                onKeyDown={(e) => { if (e.key === "Enter") sendSaved(); if (e.key === "Escape") setShowSend(false); }}
+                className="flex-1 tabular-nums" />
+              <button onClick={sendSaved} className="text-[15px] px-3.5 py-2 rounded-[10px] font-medium"
+                style={{ background: C.accent, color: "#fff" }}>보내기</button>
+              <button onClick={() => setShowSend(false)} className="text-[15px]" style={{ color: C.sub }}>취소</button>
+            </Row>
+          )}
+        </Card>
+
+        </>)}
+
+        {tab === "manage" && (<>
+
+        {/* 예산 */}
+        <Card
+          title={`주간 예산 · ${data.weekStart === 1 ? "월" : "일"}요일 시작`}
+          right={<Seg options={[[true, "자동"], [false, "수동"]]} value={data.autoBudget}
+            onChange={(k) => up((d) => { d.autoBudget = k; if (k) d.budget = null; return d; })} />}
+        >
+          <Row first>
+            <span className="text-[15px] flex-1">이번 주 예산</span>
             {data.autoBudget
               ? <span className="text-[15px] tabular-nums">{fmt(budget)}</span>
               : <Amount value={data.weeklyBudget} className="text-[15px]"
@@ -783,48 +921,7 @@ export default function MoneyBoard() {
             <Seg options={[[0, "일"], [1, "월"]]} value={data.weekStart}
               onChange={(k) => up((d) => { d.weekStart = k; d.budget = null; return d; })} />
           </Row>
-
-          {/* 입력 */}
-          <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
-            <Seg options={[["expense", "지출"], ["income", "수입"], ["transfer", "이체"]]} value={eKind} onChange={setEKind} />
-            <div className="flex flex-wrap gap-2 mt-2.5">
-              <Field type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className="text-[13px]" />
-              <Field value={eAmt} onChange={(e) => setEAmt(e.target.value)} placeholder="금액" inputMode="decimal"
-                onKeyDown={(e) => e.key === "Enter" && addEntry()} className="w-28 tabular-nums" />
-              <Field value={eText} onChange={(e) => setEText(e.target.value)}
-                placeholder={eKind === "income" ? "내용 (예: 월급)" : eKind === "transfer" ? "내용 (예: 생활비 이체)" : "내용 (예: 점심)"}
-                onKeyDown={(e) => e.key === "Enter" && addEntry()} className="flex-1 min-w-[110px]" />
-            </div>
-            <div className="flex flex-wrap items-center gap-2 mt-2.5">
-              {eKind !== "income" && (
-                <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
-                  출금 <AcctSelect value={fromId} onChange={setEFrom} />
-                </span>
-              )}
-              {eKind !== "expense" && (
-                <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
-                  입금 <AcctSelect value={toId} onChange={setETo} />
-                </span>
-              )}
-              <button onClick={addEntry}
-                className="ml-auto text-[15px] px-4 py-2 rounded-[10px] font-medium"
-                style={{ background: C.accent, color: "#fff" }}>
-                적기
-              </button>
-            </div>
-            {eKind === "expense" && (
-              <div className="text-[13px] mt-2" style={{ color: C.sub }}>
-                {spendAcc && fromId === spendAcc.id
-                  ? "주간 예산에서 빠져요."
-                  : "'쓸돈' 계좌가 아니라 주간 예산에는 안 잡혀요."}
-              </div>
-            )}
-          </div>
         </Card>
-
-        </>)}
-
-        {tab === "manage" && (<>
 
         {/* 계좌 */}
         <Card
@@ -905,23 +1002,43 @@ export default function MoneyBoard() {
             </button>
           )}
         >
+          <Row first>
+            <span className="text-[13px] flex-1" style={{ color: C.sub }}>
+              {data.lastAuto
+                ? `마지막 자동 반영: ${md(fromISO(data.lastAuto.date))} · ${data.lastAuto.count}건`
+                : "아직 자동 반영된 기록이 없어요"}
+            </span>
+            {pendingTotal > 0 && (
+              <button onClick={catchUp} className="text-[13px] px-2.5 py-1 rounded-[8px] font-medium"
+                style={{ background: C.accent, color: "#fff" }}>
+                지금 반영 {pendingTotal}건
+              </button>
+            )}
+          </Row>
           {data.rules.length === 0 && !ruleEdit && (
-            <Row first><span className="text-[15px]" style={{ color: C.sub }}>자동이체·고정수입을 등록해 두면 날짜에 맞춰 기록돼요.</span></Row>
+            <Row><span className="text-[15px]" style={{ color: C.sub }}>자동이체·고정수입을 등록해 두면 날짜에 맞춰 기록돼요.</span></Row>
           )}
-          {data.rules.map((r, i) => (
-            <Row key={r.id} first={i === 0} onClick={() => setRuleEdit({ ...r, amount: String(r.amount) })}>
-              <div className="flex-1 min-w-0">
-                <div className="text-[15px] truncate" style={{ color: r.active ? C.text : C.sub }}>{r.name}</div>
-                <div className="text-[13px] truncate" style={{ color: C.sub }}>
-                  {freqLabel(r.freq)} · {r.type === "income" ? `→ ${acctName(r.to)}` : r.type === "transfer" ? `${acctName(r.from)} → ${acctName(r.to)}` : acctName(r.from)}
+          {data.rules.map((r) => {
+            const info = ruleInfo(r);
+            return (
+              <Row key={r.id} onClick={() => setRuleEdit({ ...r, amount: String(r.amount) })}>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[15px] truncate" style={{ color: r.active ? C.text : C.sub }}>{r.name}</div>
+                  <div className="text-[13px] truncate" style={{ color: C.sub }}>
+                    {freqLabel(r.freq)} · {r.type === "income" ? `→ ${acctName(r.to)}` : r.type === "transfer" ? `${acctName(r.from)} → ${acctName(r.to)}` : acctName(r.from)}
+                  </div>
+                  <div className="text-[13px] truncate" style={{ color: C.sub }}>
+                    다음 {info.next ? md(fromISO(info.next)) : "—"} · 마지막 {info.last ? md(fromISO(info.last)) : "—"}
+                  </div>
                 </div>
-              </div>
-              {!r.active && <Tag>중지</Tag>}
-              <span className="text-[15px] tabular-nums" style={{ color: r.type === "income" ? C.accent : C.text }}>
-                {r.type === "income" ? "+" : r.type === "transfer" ? "→" : "−"}{fmt(r.amount)}
-              </span>
-            </Row>
-          ))}
+                {info.pending > 0 && <Tag>밀림 {info.pending}</Tag>}
+                {!r.active && <Tag>중지</Tag>}
+                <span className="text-[15px] tabular-nums" style={{ color: r.type === "income" ? C.accent : C.text }}>
+                  {r.type === "income" ? "+" : r.type === "transfer" ? "→" : "−"}{fmt(r.amount)}
+                </span>
+              </Row>
+            );
+          })}
 
           {ruleEdit && (
             <div className="py-3" style={{ borderTop: data.rules.length ? `1px solid ${C.line}` : "none" }}>
