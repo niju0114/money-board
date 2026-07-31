@@ -100,10 +100,16 @@ const ruleHitsOn = (rule, d) => {
 /* '쓸돈' 계좌로 매주 들어오는 활성 고정 항목이 있으면 생활비를 매주 받는 것으로 본다 */
 const hasWeeklyInflow = (d) => {
   const spend = d.accounts.find((a) => a.role === "spend");
+  const today = toISO(new Date());
   return (
     !!spend &&
     d.rules.some(
-      (r) => r.active && r.freq.kind === "weekly" && r.to === spend.id && (r.type === "income" || r.type === "transfer")
+      (r) =>
+        r.active &&
+        r.freq.kind === "weekly" &&
+        r.to === spend.id &&
+        (r.type === "income" || r.type === "transfer") &&
+        (!r.startDate || r.startDate <= today) // 아직 시작 전인 규칙은 세지 않는다
     )
   );
 };
@@ -278,11 +284,13 @@ const normalize = (p) => {
   };
 };
 
-/* 잔액 = 기준값 + (기준시각 이후 들어온 돈) − (나간 돈). 역할과 무관하게 계좌 단위로만 센다 */
+/* 잔액 = 기준값 + (기준시각 이후 들어온 돈) − (나간 돈).
+   아직 오지 않은 날짜의 기록은 실제로 빠져나간 돈이 아니므로 세지 않는다 */
 const balanceOf = (d, a) => {
+  const today = toISO(new Date());
   let v = a.baseAmount;
   for (const e of d.entries) {
-    if (e.ts <= a.baseTs) continue;
+    if (e.ts <= a.baseTs || e.date > today) continue;
     if (e.to === a.id) v += e.amount;
     if (e.from === a.id) v -= e.amount;
   }
@@ -458,6 +466,7 @@ export default function MoneyBoard() {
   const [ruleEdit, setRuleEdit] = useState(null);
   const [showSend, setShowSend] = useState(false);
   const [sendAmt, setSendAmt] = useState("");
+  const [showFuture, setShowFuture] = useState(false);
   const [pMonth, setPMonth] = useState("");
   const [pAmt, setPAmt] = useState("");
   const [pMemo, setPMemo] = useState("");
@@ -491,6 +500,23 @@ export default function MoneyBoard() {
       }
     }, 600);
     return () => clearTimeout(timer.current);
+  }, [data]);
+
+  /* 디바운스(600ms)가 끝나기 전에 앱을 벗어나면 마지막 편집이 사라진다 → 그 자리에서 저장 */
+  useEffect(() => {
+    if (!data) return;
+    const flush = () => {
+      try {
+        clearTimeout(timer.current);
+        localStorage.setItem(KEY, JSON.stringify(data));
+      } catch { /* 저장 실패는 디바운스 저장이 다시 시도한다 */ }
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", flush);
+    };
   }, [data]);
 
   /* 주가 바뀌면 그 주의 예산을 한 번 확정하고, 주중에는 건드리지 않는다 */
@@ -539,9 +565,13 @@ export default function MoneyBoard() {
   const cycle = effectiveCycle(data);
 
   const budget = data.autoBudget ? data.budget?.amount ?? 0 : data.weeklyBudget;
+  // 아직 오지 않은 날짜의 기록은 현재 집계에 넣지 않는다 (예정 기록)
+  const isPast = (e) => e.date <= todayISO;
   // 주간 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
   const fromSpend = (e) => e.type === "expense" && spendAcc && e.from === spendAcc.id;
-  const weekSpent = data.entries.filter((e) => fromSpend(e) && inThisWeek(e.date)).reduce((s, e) => s + e.amount, 0);
+  const weekSpent = data.entries
+    .filter((e) => fromSpend(e) && isPast(e) && inThisWeek(e.date))
+    .reduce((s, e) => s + e.amount, 0);
   const remaining = Math.round(budget - weekSpent);
   const over = remaining < 0;
   const daysLeftWeek = 7 - ((nowD.getDay() - data.weekStart + 7) % 7); // 오늘 포함
@@ -568,10 +598,15 @@ export default function MoneyBoard() {
   const cycleLast = new Date(cycleEnd);
   cycleLast.setDate(cycleLast.getDate() - 1);
   const inCycle = (iso) => iso >= toISO(cycleStart) && iso < toISO(cycleEnd);
-  const cycleSpend = data.entries.filter((e) => fromSpend(e) && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
-  const cycleAll = data.entries.filter((e) => e.type === "expense" && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
+  const cycleSpend = data.entries
+    .filter((e) => fromSpend(e) && isPast(e) && inCycle(e.date))
+    .reduce((s, e) => s + e.amount, 0);
+  const cycleAll = data.entries
+    .filter((e) => e.type === "expense" && isPast(e) && inCycle(e.date))
+    .reduce((s, e) => s + e.amount, 0);
 
-  /* 이번 사이클에서 아낀 돈 — 지난 날들의 (그날 예산 − 그날 지출) 합 */
+  /* 아낀 돈 — 저장하지 않고 매번 다시 구한다.
+     지난 날들의 (그날 예산 − 그날 지출) 합이라 초과한 날은 음수로 상계된다 */
   const dailyRef = budget / 7;
   let savedRaw = 0;
   for (let day = startOfDay(cycleStart), g = 0; g < 45 && day < startOfDay(nowD); g++, day = addDays(day, 1)) {
@@ -579,9 +614,9 @@ export default function MoneyBoard() {
   }
   // 이미 투자로 보낸 몫은 빼고 남은 것만 보여준다
   const sentSaved = data.entries
-    .filter((e) => e.type === "transfer" && e.savedFrom && inCycle(e.date))
+    .filter((e) => e.type === "transfer" && e.savedFrom && isPast(e) && inCycle(e.date))
     .reduce((s, e) => s + e.amount, 0);
-  const saved = Math.max(0, Math.round(savedRaw) - sentSaved);
+  const saved = Math.round(savedRaw) - sentSaved;
 
   const pay = paydayInfo(data.payday);
 
@@ -757,10 +792,60 @@ export default function MoneyBoard() {
     setPMonth(""); setPAmt(""); setPMemo("");
   };
 
-  /* 가계부 그룹핑: 주 → 일 */
-  const byWeek = {};
-  for (const e of data.entries) (byWeek[toISO(sow(fromISO(e.date)))] ??= []).push(e);
-  const weekKeys = Object.keys(byWeek).sort().reverse().slice(0, 6);
+  /* 가계부 — 지난 기록은 날짜별로, 아직 오지 않은 기록은 '예정'으로 분리 */
+  const pastEntries = data.entries.filter(isPast);
+  const futureEntries = data.entries.filter((e) => !isPast(e)).sort((a, b) => a.date.localeCompare(b.date));
+  const pastDates = [...new Set(pastEntries.map((e) => e.date))].sort().reverse().slice(0, 40);
+  const acctLine = (e) =>
+    e.type === "income" ? acctName(e.to) : e.type === "transfer" ? `${acctName(e.from)} → ${acctName(e.to)}` : acctName(e.from);
+
+  const renderEntry = (e, first) =>
+    entryEdit && entryEdit.id === e.id ? (
+      <div key={e.id} className="py-3" style={{ borderTop: first ? "none" : `1px solid ${C.line}` }}>
+        <div className="flex flex-wrap gap-2">
+          <Field type="date" value={entryEdit.date}
+            onChange={(ev) => setEntryEdit({ ...entryEdit, date: ev.target.value })} className="text-[13px]" />
+          <Field autoFocus value={entryEdit.amt} inputMode="decimal"
+            onChange={(ev) => setEntryEdit({ ...entryEdit, amt: ev.target.value })}
+            onKeyDown={(ev) => { if (ev.key === "Enter") saveEntryEdit(); if (ev.key === "Escape") setEntryEdit(null); }}
+            className="w-28 tabular-nums" />
+          <Field value={entryEdit.text}
+            onChange={(ev) => setEntryEdit({ ...entryEdit, text: ev.target.value })}
+            onKeyDown={(ev) => { if (ev.key === "Enter") saveEntryEdit(); if (ev.key === "Escape") setEntryEdit(null); }}
+            className="flex-1 min-w-[110px]" />
+        </div>
+        <div className="flex flex-wrap items-center gap-2 mt-2.5">
+          {entryEdit.type !== "income" && (
+            <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
+              출금 <AcctSelect value={entryEdit.from} onChange={(v) => setEntryEdit({ ...entryEdit, from: v })} />
+            </span>
+          )}
+          {entryEdit.type !== "expense" && (
+            <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
+              입금 <AcctSelect value={entryEdit.to} onChange={(v) => setEntryEdit({ ...entryEdit, to: v })} />
+            </span>
+          )}
+          <button onClick={() => setEntryEdit(null)} className="ml-auto text-[15px]" style={{ color: C.sub }}>취소</button>
+          <button onClick={saveEntryEdit} className="text-[15px] px-4 py-2 rounded-[10px] font-medium"
+            style={{ background: C.accent, color: "#fff" }}>저장</button>
+        </div>
+      </div>
+    ) : (
+      <Row key={e.id} first={first} onClick={() => startEntryEdit(e)}>
+        <span className="text-[15px] flex-1 min-w-0 truncate"
+          style={{ color: e.type === "transfer" ? C.sub : C.text }}>{e.text}</span>
+        {e.auto && <Tag>자동</Tag>}
+        <div className="text-right shrink-0">
+          <div className="text-[15px] tabular-nums"
+            style={{ color: e.type === "income" ? C.accent : e.type === "transfer" ? C.sub : C.text }}>
+            {e.type === "income" ? "+" : e.type === "transfer" ? "→" : "−"}{fmt(e.amount)}
+          </div>
+          <div className="text-[13px] truncate max-w-[150px]" style={{ color: C.sub }}>{acctLine(e)}</div>
+        </div>
+        <button onClick={(ev) => { ev.stopPropagation(); removeEntry(e.id); }}
+          style={{ color: C.sub }} title="삭제">×</button>
+      </Row>
+    );
 
   const AcctSelect = ({ value, onChange }) => (
     <select value={value ?? ""} onChange={(e) => onChange(e.target.value)}
@@ -828,7 +913,7 @@ export default function MoneyBoard() {
                 : "오늘 안 쓴 만큼 내일 예산이 늘어나요"}
             </div>
             <div className="text-[13px] mt-1" style={{ color: C.sub }}>
-              이번 주 남은 {fmt(remaining)} · 주간 예산 {fmt(budget)}
+              이번 주 남은 {fmt(remaining)} · 주간 예산 {fmt(budget)} · 남은 {daysLeftWeek}일
             </div>
           </div>
 
@@ -920,6 +1005,14 @@ export default function MoneyBoard() {
             <span className="text-[15px] flex-1">주 시작</span>
             <Seg options={[[0, "일"], [1, "월"]]} value={data.weekStart}
               onChange={(k) => up((d) => { d.weekStart = k; d.budget = null; return d; })} />
+          </Row>
+          <Row align="items-start">
+            <span className="text-[13px] shrink-0" style={{ color: C.sub }}>
+              이번 사이클 {md(cycleStart)} – {md(cycleLast)}
+            </span>
+            <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
+              쓸돈 {fmt(cycleSpend)} · 전체 {fmt(cycleAll)}
+            </span>
           </Row>
         </Card>
 
@@ -1124,86 +1217,44 @@ export default function MoneyBoard() {
         {/* 가계부 */}
         <Card title="가계부">
           <Row first>
-            <span className="text-[13px] flex-1" style={{ color: C.sub }}>
-              이번 사이클 {md(cycleStart)} – {md(cycleLast)}
-            </span>
+            <span className="text-[13px] flex-1" style={{ color: C.sub }}>이번 주</span>
             <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>
-              쓸돈 {fmt(cycleSpend)} · 전체 {fmt(cycleAll)}
+              {fmt(weekSpent)} / 예산 {fmt(budget)}
             </span>
           </Row>
-          {weekKeys.length === 0 && (
+          {pastDates.length === 0 && futureEntries.length === 0 && (
             <Row><span className="text-[15px]" style={{ color: C.sub }}>아직 기록이 없어요.</span></Row>
           )}
-          {weekKeys.map((wk) => {
-            const wkStart = fromISO(wk);
-            const wkEnd = new Date(wkStart); wkEnd.setDate(wkEnd.getDate() + 6);
-            const list = byWeek[wk];
-            const wWeek = list.filter(fromSpend).reduce((s, e) => s + e.amount, 0);
-            const dates = [...new Set(list.map((e) => e.date))].sort().reverse();
+          {pastDates.map((dt, di) => {
+            const list = pastEntries.filter((e) => e.date === dt);
+            const dSum = list.filter((e) => e.type === "expense").reduce((s, e) => s + e.amount, 0);
+            // 주가 바뀌는 자리에만 얇은 선을 둔다
+            const newWeek = di > 0 && toISO(sow(fromISO(dt))) !== toISO(sow(fromISO(pastDates[di - 1])));
             return (
-              <div key={wk}>
-                <Row>
-                  <span className="text-[13px] font-medium flex-1">{md(wkStart)} – {md(wkEnd)}</span>
-                  <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>
-                    쓸돈 {fmt(wWeek)} / {fmt(budget)}
-                  </span>
-                </Row>
-                {dates.map((dt) => (
-                  <div key={dt}>
-                    <div className="pt-3 pb-1 text-[13px]" style={{ color: C.sub }}>{dayLabel(dt)}</div>
-                    {list.filter((e) => e.date === dt).map((e, i) =>
-                      entryEdit && entryEdit.id === e.id ? (
-                        <div key={e.id} className="py-3" style={{ borderTop: i === 0 ? "none" : `1px solid ${C.line}` }}>
-                          <div className="flex flex-wrap gap-2">
-                            <Field type="date" value={entryEdit.date}
-                              onChange={(ev) => setEntryEdit({ ...entryEdit, date: ev.target.value })} className="text-[13px]" />
-                            <Field autoFocus value={entryEdit.amt} inputMode="decimal"
-                              onChange={(ev) => setEntryEdit({ ...entryEdit, amt: ev.target.value })}
-                              onKeyDown={(ev) => { if (ev.key === "Enter") saveEntryEdit(); if (ev.key === "Escape") setEntryEdit(null); }}
-                              className="w-28 tabular-nums" />
-                            <Field value={entryEdit.text}
-                              onChange={(ev) => setEntryEdit({ ...entryEdit, text: ev.target.value })}
-                              onKeyDown={(ev) => { if (ev.key === "Enter") saveEntryEdit(); if (ev.key === "Escape") setEntryEdit(null); }}
-                              className="flex-1 min-w-[110px]" />
-                          </div>
-                          <div className="flex flex-wrap items-center gap-2 mt-2.5">
-                            {entryEdit.type !== "income" && (
-                              <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
-                                출금 <AcctSelect value={entryEdit.from} onChange={(v) => setEntryEdit({ ...entryEdit, from: v })} />
-                              </span>
-                            )}
-                            {entryEdit.type !== "expense" && (
-                              <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
-                                입금 <AcctSelect value={entryEdit.to} onChange={(v) => setEntryEdit({ ...entryEdit, to: v })} />
-                              </span>
-                            )}
-                            <button onClick={() => setEntryEdit(null)} className="ml-auto text-[15px]" style={{ color: C.sub }}>취소</button>
-                            <button onClick={saveEntryEdit} className="text-[15px] px-4 py-2 rounded-[10px] font-medium"
-                              style={{ background: C.accent, color: "#fff" }}>저장</button>
-                          </div>
-                        </div>
-                      ) : (
-                        <Row key={e.id} first={i === 0} onClick={() => startEntryEdit(e)}>
-                          <span className="text-[15px] flex-1 min-w-0 truncate"
-                            style={{ color: e.type === "transfer" ? C.sub : C.text }}>{e.text}</span>
-                          {e.auto && <Tag>자동</Tag>}
-                          {e.type === "income" && <Tag tone="accent">{acctName(e.to)}</Tag>}
-                          {e.type === "transfer" && <Tag>이체</Tag>}
-                          {e.type === "expense" && !fromSpend(e) && <Tag>{acctName(e.from)}</Tag>}
-                          <span className="text-[15px] tabular-nums"
-                            style={{ color: e.type === "income" ? C.accent : e.type === "transfer" ? C.sub : C.text }}>
-                            {e.type === "income" ? "+" : e.type === "transfer" ? "→" : "−"}{fmt(e.amount)}
-                          </span>
-                          <button onClick={(ev) => { ev.stopPropagation(); removeEntry(e.id); }}
-                            style={{ color: C.sub }} title="삭제">×</button>
-                        </Row>
-                      )
-                    )}
-                  </div>
-                ))}
+              <div key={dt} style={newWeek ? { borderTop: `1px solid ${C.line}`, marginTop: 10 } : undefined}>
+                <div className="pt-3 pb-1 flex justify-between text-[13px]" style={{ color: C.sub }}>
+                  <span>{dayLabel(dt)}</span>
+                  <span className="tabular-nums">{fmt(dSum)}</span>
+                </div>
+                {list.map((e, i) => renderEntry(e, i === 0))}
               </div>
             );
           })}
+          {futureEntries.length > 0 && (
+            <>
+              <Row onClick={() => setShowFuture(!showFuture)}>
+                <span className="text-[15px] flex-1">예정 {futureEntries.length}건</span>
+                <span className="text-[13px]" style={{ color: C.accent }}>{showFuture ? "접기" : "펼치기"}</span>
+              </Row>
+              {showFuture &&
+                [...new Set(futureEntries.map((e) => e.date))].map((dt) => (
+                  <div key={`f-${dt}`}>
+                    <div className="pt-3 pb-1 text-[13px]" style={{ color: C.sub }}>{dayLabel(dt)}</div>
+                    {futureEntries.filter((e) => e.date === dt).map((e, i) => renderEntry(e, i === 0))}
+                  </div>
+                ))}
+            </>
+          )}
         </Card>
 
         </>)}
