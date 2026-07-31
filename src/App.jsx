@@ -191,14 +191,15 @@ const normalize = (p) => {
     cycleMode: p.cycleMode === "weekly" ? "weekly" : "payday",
     weekStart: p.weekStart === 1 ? 1 : 0,
     autoBudget: typeof p.autoBudget === "boolean" ? p.autoBudget : true,
+    // weekDays가 없으면 주 단위로 계산하던 옛 예산 → 버리고 새 방식으로 다시 잡게 둔다
     budget:
-      p.budget && typeof p.budget.week === "string"
+      p.budget && typeof p.budget.week === "string" && Number.isFinite(p.budget.weekDays)
         ? {
             week: p.budget.week,
             amount: cv(p.budget.amount),
             balance: cv(p.budget.balance),
-            weeks: Number(p.budget.weeks) || 1,
-            days: Number(p.budget.days) || 7,
+            days: Number(p.budget.days) || 1,
+            weekDays: Number(p.budget.weekDays) || 1,
             until: typeof p.budget.until === "string" ? p.budget.until : null,
           }
         : null,
@@ -249,7 +250,7 @@ const balanceOf = (d, a) => {
   return Math.round(v);
 };
 
-/* 자동 예산: 다음 생활비 입금일 전날까지를 남은 주수로 나눈다 */
+/* 자동 예산: 다음 입금일까지 하루치를 구하고, 이번 주에 남은 날수만큼만 이번 주 예산으로 잡는다 */
 const budgetBasis = (d, spendBal) => {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -262,12 +263,26 @@ const budgetBasis = (d, spendBal) => {
     end = new Date(today.getFullYear(), today.getMonth(), d.payday);
     if (today.getDate() >= d.payday) end.setMonth(end.getMonth() + 1);
   }
-  const days = Math.max(1, Math.round((end - today) / 86400000));
-  const weeks = weekly ? 1 : Math.max(1, Math.ceil(days / 7));
-  const amount = weekly ? Math.max(0, Math.round(spendBal)) : Math.max(0, Math.floor(spendBal / weeks / 1000) * 1000);
+  const days = Math.max(1, Math.round((end - today) / 86400000)); // 오늘 포함, 다음 입금일 전날까지
+  // 이번 주에 남은 날수(오늘 포함) — 주 시작 설정을 따르고, 남은 일수를 넘지 않는다
+  const weekDays = Math.min(days, 7 - ((today.getDay() - d.weekStart + 7) % 7));
+  const amount = weekly
+    ? Math.max(0, Math.round(spendBal))
+    : Math.max(0, Math.floor(((spendBal / days) * weekDays) / 1000) * 1000);
   const last = new Date(end);
   last.setDate(last.getDate() - 1);
-  return { weeks, days, balance: spendBal, amount, until: toISO(last) };
+  return { days, weekDays, balance: spendBal, amount, until: toISO(last) };
+};
+
+const spendBalance = (d) => {
+  const s = d.accounts.find((a) => a.role === "spend");
+  return s ? balanceOf(d, s) : 0;
+};
+
+/* 이번 주 예산을 지금 잔액으로 다시 확정한다 */
+const refreshBudget = (d) => {
+  d.budget = { week: toISO(startOfWeek(new Date(), d.weekStart)), ...budgetBasis(d, spendBalance(d)) };
+  return d;
 };
 
 /* ── 공용 컴포넌트 ─────────────────────────────────── */
@@ -404,7 +419,10 @@ export default function MoneyBoard() {
       const r = localStorage.getItem(KEY);
       if (r) d = normalize(JSON.parse(r));
     } catch { /* 저장본이 없거나 깨졌으면 시드로 시작 */ }
+    const before = spendBalance(d);
     runRules(d); // 앱을 열 때 도래한 고정 항목을 기록으로 만든다
+    // 고정 수입·이체가 쓸돈으로 들어왔으면 이번 주 예산을 바로 다시 잡는다
+    if (d.autoBudget && spendBalance(d) > before) refreshBudget(d);
     setData(d);
     loaded.current = true;
   }, []);
@@ -446,6 +464,16 @@ export default function MoneyBoard() {
 
   /* ── 파생값 ── */
   const up = (fn) => setData((d) => fn(structuredClone(d)));
+
+  /* 기록을 건드릴 때 쓴다 — 쓸돈 잔액이 늘어난 경우에만 이번 주 예산을 다시 잡고,
+     지출로 줄어든 경우에는 주중 고정을 유지한다 */
+  const upEntries = (fn) =>
+    setData((prev) => {
+      const before = spendBalance(prev);
+      const d = fn(structuredClone(prev));
+      if (d.autoBudget && spendBalance(d) > before) refreshBudget(d);
+      return d;
+    });
   const todayISO = toISO(new Date());
   const nowD = new Date();
   const sow = (d) => startOfWeek(d, data.weekStart);
@@ -537,7 +565,7 @@ export default function MoneyBoard() {
       src: income ? null : eSrc,
       auto: false, ruleId: null,
     };
-    up((d) => { d.entries.unshift(entry); d.entries = d.entries.slice(0, 500); return d; });
+    upEntries((d) => { d.entries.unshift(entry); d.entries = d.entries.slice(0, 500); return d; });
     setEAmt(""); setEText("");
     setEKind("expense"); // 수입 모드가 남아 다음 지출까지 수입으로 잡히는 걸 막는다
   };
@@ -545,23 +573,19 @@ export default function MoneyBoard() {
   const pullFromBox = () => {
     const n = parseWon(pullAmt);
     if (!n || n <= 0 || !saveAcc || !spendAcc) return;
-    up((d) => {
+    upEntries((d) => {
       d.entries.unshift({
         id: uid(), ts: Date.now(), date: todayISO, type: "transfer", amount: n,
         text: `${saveAcc.name} → ${spendAcc.name}`, from: saveAcc.id, to: spendAcc.id,
         src: null, auto: false, ruleId: null,
       });
       d.entries = d.entries.slice(0, 500);
-      if (d.autoBudget) {
-        const t = d.accounts.find((a) => a.id === spendAcc.id);
-        d.budget = { week: toISO(startOfWeek(new Date(), d.weekStart)), ...budgetBasis(d, balanceOf(d, t)) };
-      }
       return d;
     });
     setPullAmt(""); setShowPull(false);
   };
 
-  const removeEntry = (id) => up((d) => { d.entries = d.entries.filter((x) => x.id !== id); return d; });
+  const removeEntry = (id) => upEntries((d) => { d.entries = d.entries.filter((x) => x.id !== id); return d; });
 
   const startEntryEdit = (e) =>
     setEntryEdit({
@@ -572,7 +596,7 @@ export default function MoneyBoard() {
   const saveEntryEdit = () => {
     const n = parseWon(entryEdit.amt);
     if (!n || n <= 0) return;
-    up((d) => {
+    upEntries((d) => {
       const e = d.entries.find((x) => x.id === entryEdit.id);
       if (!e) return d;
       e.date = entryEdit.date || e.date;
@@ -710,10 +734,12 @@ export default function MoneyBoard() {
                   onCommit={(n) => up((d) => { d.weeklyBudget = n; return d; })} />}
           </Row>
           {data.autoBudget && data.budget && (
-            <Row>
-              <span className="text-[13px] flex-1" style={{ color: C.sub }}>계산 근거</span>
-              <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>
-                {fmt(data.budget.balance)} ÷ {data.budget.weeks}주
+            <Row align="items-start">
+              <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산 근거</span>
+              <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
+                {data.cycleMode === "weekly"
+                  ? `${fmt(data.budget.balance)} 전액`
+                  : `${fmt(data.budget.balance)} ÷ ${data.budget.days}일 × ${data.budget.weekDays}일`}
                 {data.budget.until && ` (${md(fromISO(data.budget.until))}까지)`}
               </span>
             </Row>
