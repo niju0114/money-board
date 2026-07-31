@@ -1,1 +1,60 @@
 @import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+  --bg: #f2f2f7;
+  --card: #ffffff;
+  --text: #1c1c1e;
+  --sub: #8e8e93;
+  --line: rgba(0, 0, 0, 0.08);
+  --fill: rgba(120, 120, 128, 0.12);
+  --field: rgba(120, 120, 128, 0.08);
+  --accent: #34c759;
+  --danger: #ff3b30;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --card: #1c1c1e;
+    --text: #ffffff;
+    --sub: #8e8e93;
+    --line: rgba(255, 255, 255, 0.12);
+    --fill: rgba(120, 120, 128, 0.28);
+    --field: rgba(120, 120, 128, 0.2);
+    --accent: #30d158;
+    --danger: #ff453a;
+  }
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui,
+    "Segoe UI", Roboto, "Helvetica Neue", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+select,
+textarea {
+  background: var(--field);
+}
+
+::placeholder {
+  color: var(--sub);
+  opacity: 1;
+}
