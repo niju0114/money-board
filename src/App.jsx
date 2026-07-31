@@ -168,6 +168,10 @@ const normalize = (p) => {
 
   const spendId = accounts.find((a) => a.role === "spend")?.id ?? null;
   const saveId = accounts.find((a) => a.role === "save")?.id ?? null;
+  const firstId = accounts[0]?.id ?? null;
+  const hubId = accounts.find((a) => a.role === "hub")?.id ?? firstId;
+  // 비었거나 지워진 계좌를 가리키는 기록은 잔액에 반영되지 않으므로 실재하는 계좌로 붙여준다
+  const live = (id, fb) => (id != null && accounts.some((a) => a.id === id) ? id : fb);
 
   /* 지출의 출처는 이제 출금 계좌 하나로만 나타낸다.
      구버전 src는 week → 쓸돈계좌, box → 모음계좌로 옮긴다 */
@@ -178,6 +182,9 @@ const normalize = (p) => {
     let to = e.to ?? null;
     if (type === "expense" && from == null) from = e.src === "box" ? saveId : spendId;
     if (type === "income" && to == null) to = e.acct ?? null;
+    // 어느 계좌에도 걸리지 않는 기록이 남지 않게 한다
+    if (type !== "income") from = live(from, spendId ?? firstId);
+    if (type !== "expense") to = live(to, hubId);
     return {
       id: e.id ?? uid(),
       ts: Number.isFinite(e.ts) ? e.ts : Math.min(fromISO(e.date).getTime(), now - 1),
@@ -515,7 +522,9 @@ export default function MoneyBoard() {
   const weekSpent = data.entries.filter((e) => fromSpend(e) && inThisWeek(e.date)).reduce((s, e) => s + e.amount, 0);
   const remaining = Math.round(budget - weekSpent);
   const over = remaining < 0;
-  const daysLeftWeek = 7 - ((nowD.getDay() - data.weekStart + 7) % 7);
+  const daysLeftWeek = 7 - ((nowD.getDay() - data.weekStart + 7) % 7); // 오늘 포함
+  // '하루 N꼴'은 저장된 일일 단가를 쓰지 않고 매 렌더에서 다시 구한다 —
+  // 주중에 예산이 증분으로 오르면 남은 돈과 같은 렌더에서 함께 움직인다
   const perDay = Math.max(remaining, 0) / daysLeftWeek;
 
   const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
@@ -817,6 +826,76 @@ export default function MoneyBoard() {
 
         {tab === "manage" && (<>
 
+        {/* 계좌 */}
+        <Card
+          title="계좌"
+          right={
+            <button onClick={() => setEditAcc(!editAcc)} className="text-[13px] flex items-center gap-1" style={{ color: C.accent }}>
+              {editAcc ? <><Check size={14} /> 완료</> : <><Pencil size={13} /> 편집</>}
+            </button>
+          }
+        >
+          {roleWarn && (
+            <Row first>
+              <span className="text-[13px]" style={{ color: C.danger }}>
+                {roleWarn} — 자동 예산이 '쓸돈' 역할 계좌를 기준으로 잡혀요.
+              </span>
+            </Row>
+          )}
+          {data.accounts.map((a, i) => (
+            <Row key={a.id} first={i === 0 && !roleWarn}>
+              <button
+                onClick={() => editAcc && up((d) => {
+                  const t = d.accounts.find((x) => x.id === a.id);
+                  t.role = ROLE_ORDER[(ROLE_ORDER.indexOf(t.role) + 1) % ROLE_ORDER.length];
+                  return d;
+                })}
+                className="shrink-0 w-11 text-left text-[13px]"
+                style={{ color: C.sub }}
+                title={editAcc ? "눌러서 역할 변경" : ROLES[a.role].label}
+              >
+                {ROLES[a.role].label}
+              </button>
+              <div className="flex-1 min-w-0">
+                {editAcc ? (
+                  <Field value={a.name} className="w-full text-[15px]"
+                    onChange={(e) => up((d) => { d.accounts.find((x) => x.id === a.id).name = e.target.value; return d; })} />
+                ) : (
+                  <>
+                    <div className="text-[15px] truncate">{a.name}</div>
+                    {a.note && <div className="text-[13px] truncate" style={{ color: C.sub }}>{a.note}</div>}
+                  </>
+                )}
+              </div>
+              <Amount value={bal(a)} className="text-[15px]"
+                onCommit={(n) => up((d) => {
+                  const t = d.accounts.find((x) => x.id === a.id);
+                  t.baseAmount = n;
+                  t.baseTs = Date.now(); // 여기서부터 다시 센다
+                  return d;
+                })} />
+              {editAcc && (
+                <button onClick={() => up((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id); return d; })}
+                  style={{ color: C.danger }} title="삭제"><Trash2 size={17} /></button>
+              )}
+            </Row>
+          ))}
+          {editAcc && (
+            <Row onClick={() => up((d) => { d.accounts.push({ id: uid(), name: "새 계좌", note: "", baseAmount: 0, baseTs: Date.now(), role: "hub" }); return d; })}>
+              <span className="text-[15px] flex items-center gap-1.5" style={{ color: C.accent }}><Plus size={15} /> 계좌 추가</span>
+            </Row>
+          )}
+          <Row>
+            <div className="flex-1">
+              <div className="text-[13px]" style={{ color: C.sub }}>전체</div>
+              <div className="text-[22px] font-semibold tabular-nums tracking-tight">{fmt(cashTotal + investTotal)}</div>
+            </div>
+            <div className="text-right text-[13px] tabular-nums" style={{ color: C.sub }}>
+              현금 {fmt(cashTotal)}<br />투자 {fmt(investTotal)}
+            </div>
+          </Row>
+        </Card>
+
         {/* 고정 항목 */}
         <Card
           title="고정 항목"
@@ -1060,76 +1139,6 @@ export default function MoneyBoard() {
               onKeyDown={(e) => e.key === "Enter" && addPlanned()} className="flex-1 min-w-[80px]" />
             <button onClick={addPlanned} className="text-[15px] px-3.5 py-2 rounded-[10px]" style={{ color: C.accent }}>추가</button>
           </div>
-        </Card>
-
-        {/* 계좌 */}
-        <Card
-          title="계좌"
-          right={
-            <button onClick={() => setEditAcc(!editAcc)} className="text-[13px] flex items-center gap-1" style={{ color: C.accent }}>
-              {editAcc ? <><Check size={14} /> 완료</> : <><Pencil size={13} /> 편집</>}
-            </button>
-          }
-        >
-          {roleWarn && (
-            <Row first>
-              <span className="text-[13px]" style={{ color: C.danger }}>
-                {roleWarn} — 자동 예산과 박스 끌어오기가 '쓸돈'·'모음' 역할을 씁니다.
-              </span>
-            </Row>
-          )}
-          {data.accounts.map((a, i) => (
-            <Row key={a.id} first={i === 0 && !roleWarn}>
-              <button
-                onClick={() => editAcc && up((d) => {
-                  const t = d.accounts.find((x) => x.id === a.id);
-                  t.role = ROLE_ORDER[(ROLE_ORDER.indexOf(t.role) + 1) % ROLE_ORDER.length];
-                  return d;
-                })}
-                className="shrink-0 w-11 text-left text-[13px]"
-                style={{ color: C.sub }}
-                title={editAcc ? "눌러서 역할 변경" : ROLES[a.role].label}
-              >
-                {ROLES[a.role].label}
-              </button>
-              <div className="flex-1 min-w-0">
-                {editAcc ? (
-                  <Field value={a.name} className="w-full text-[15px]"
-                    onChange={(e) => up((d) => { d.accounts.find((x) => x.id === a.id).name = e.target.value; return d; })} />
-                ) : (
-                  <>
-                    <div className="text-[15px] truncate">{a.name}</div>
-                    {a.note && <div className="text-[13px] truncate" style={{ color: C.sub }}>{a.note}</div>}
-                  </>
-                )}
-              </div>
-              <Amount value={bal(a)} className="text-[15px]"
-                onCommit={(n) => up((d) => {
-                  const t = d.accounts.find((x) => x.id === a.id);
-                  t.baseAmount = n;
-                  t.baseTs = Date.now(); // 여기서부터 다시 센다
-                  return d;
-                })} />
-              {editAcc && (
-                <button onClick={() => up((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id); return d; })}
-                  style={{ color: C.danger }} title="삭제"><Trash2 size={17} /></button>
-              )}
-            </Row>
-          ))}
-          {editAcc && (
-            <Row onClick={() => up((d) => { d.accounts.push({ id: uid(), name: "새 계좌", note: "", baseAmount: 0, baseTs: Date.now(), role: "hub" }); return d; })}>
-              <span className="text-[15px] flex items-center gap-1.5" style={{ color: C.accent }}><Plus size={15} /> 계좌 추가</span>
-            </Row>
-          )}
-          <Row>
-            <div className="flex-1">
-              <div className="text-[13px]" style={{ color: C.sub }}>전체</div>
-              <div className="text-[22px] font-semibold tabular-nums tracking-tight">{fmt(cashTotal + investTotal)}</div>
-            </div>
-            <div className="text-right text-[13px] tabular-nums" style={{ color: C.sub }}>
-              현금 {fmt(cashTotal)}<br />투자 {fmt(investTotal)}
-            </div>
-          </Row>
         </Card>
 
         {/* 메모 */}
