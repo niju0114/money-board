@@ -26,10 +26,10 @@ const KEY = "minjun-money-v1";
 
 /* 공개 저장소에 올라가므로 시드에는 개인 금액·항목을 두지 않는다 */
 const SEED = {
-  v: 8,
+  v: 9,
   unit: "won",
   payday: 25,
-  cycleMode: "payday", // 생활비 입금 주기: weekly | payday
+  cycleMode: "auto", // 생활비 입금 주기: auto | weekly | payday
   weekStart: 0, // 주 시작 요일: 0=일, 1=월
   autoBudget: true,
   budget: null,
@@ -85,14 +85,28 @@ function paydayInfo(payday) {
 
 /* ── 고정 항목(규칙) ───────────────────────────────── */
 const freqLabel = (f) =>
-  f.kind === "weekly" ? `매주 ${WD[f.dow]}요일` : `매월 ${f.day}일`;
+  f.kind === "weekly" ? `매주 ${WD[f.dow]}요일` : f.kind === "monthEnd" ? "매월 말일" : `매월 ${f.day}일`;
 
-/* 그 날짜에 규칙이 도래하는지 — 매월 31일 규칙은 짧은 달의 말일로 당겨진다 */
+/* 그 날짜에 규칙이 도래하는지 — 매월 29·30·31일 규칙은 그 달에 없으면 말일로 당겨진다 */
 const ruleHitsOn = (rule, d) => {
   if (rule.startDate && toISO(d) < rule.startDate) return false;
+  const last = lastDayOf(d.getFullYear(), d.getMonth());
   if (rule.freq.kind === "weekly") return d.getDay() === rule.freq.dow;
-  return d.getDate() === Math.min(rule.freq.day, lastDayOf(d.getFullYear(), d.getMonth()));
+  if (rule.freq.kind === "monthEnd") return d.getDate() === last;
+  return d.getDate() === Math.min(rule.freq.day, last);
 };
+
+/* '쓸돈' 계좌로 매주 들어오는 활성 고정 항목이 있으면 생활비를 매주 받는 것으로 본다 */
+const hasWeeklyInflow = (d) => {
+  const spend = d.accounts.find((a) => a.role === "spend");
+  return (
+    !!spend &&
+    d.rules.some(
+      (r) => r.active && r.freq.kind === "weekly" && r.to === spend.id && (r.type === "income" || r.type === "transfer")
+    )
+  );
+};
+const effectiveCycle = (d) => (d.cycleMode === "auto" ? (hasWeeklyInflow(d) ? "weekly" : "payday") : d.cycleMode);
 
 /* 마지막 실행일부터 오늘까지 도래한 규칙을 기록으로 만든다 (미래 생성 없음, 중복 없음) */
 const runRules = (d) => {
@@ -121,7 +135,6 @@ const runRules = (d) => {
         text: r.name,
         from: r.type === "income" ? null : r.from ?? null,
         to: r.type === "expense" ? null : r.to ?? null,
-        src: r.type === "expense" ? r.src ?? null : null,
         auto: true,
         ruleId: r.id,
       });
@@ -156,19 +169,15 @@ const normalize = (p) => {
   const spendId = accounts.find((a) => a.role === "spend")?.id ?? null;
   const saveId = accounts.find((a) => a.role === "save")?.id ?? null;
 
-  /* 구버전 기록(expenses)을 계좌 단위 기록(entries)으로 옮긴다:
-     week 지출 → from=쓸돈계좌, box 지출 → from=모음계좌 */
+  /* 지출의 출처는 이제 출금 계좌 하나로만 나타낸다.
+     구버전 src는 week → 쓸돈계좌, box → 모음계좌로 옮긴다 */
   const rawEntries = Array.isArray(p.entries) ? p.entries : Array.isArray(p.expenses) ? p.expenses : [];
   const entries = rawEntries.map((e) => {
     const type = e.type ?? (e.kind === "income" ? "income" : e.kind === "transfer" ? "transfer" : "expense");
-    const src = type === "expense" ? (e.src === "week" || e.src === "box" ? e.src : null) : null;
     let from = e.from ?? null;
     let to = e.to ?? null;
-    if (!("type" in e)) {
-      // 구버전 구조에서 옮겨오는 경우에만 출처/도착을 채운다
-      if (type === "expense") { from = src === "box" ? saveId : spendId; to = null; }
-      else if (type === "income") { from = null; to = e.acct ?? null; }
-    }
+    if (type === "expense" && from == null) from = e.src === "box" ? saveId : spendId;
+    if (type === "income" && to == null) to = e.acct ?? null;
     return {
       id: e.id ?? uid(),
       ts: Number.isFinite(e.ts) ? e.ts : Math.min(fromISO(e.date).getTime(), now - 1),
@@ -176,19 +185,20 @@ const normalize = (p) => {
       type,
       amount: cv(e.amount),
       text: e.text ?? "",
-      from,
-      to,
-      src,
+      from: type === "income" ? null : from,
+      to: type === "expense" ? null : to,
       auto: e.auto === true,
       ruleId: e.ruleId ?? null,
     };
   });
 
   return {
-    v: 8,
+    v: 9,
     unit: "won",
     payday: Number.isFinite(p.payday) ? p.payday : SEED.payday,
-    cycleMode: p.cycleMode === "weekly" ? "weekly" : "payday",
+    // v9부터 자동 판정이 기본 — 그 전 저장본의 값은 앱 기본값이었을 뿐이라 auto로 넘긴다
+    cycleMode:
+      Number(p.v) >= 9 && (p.cycleMode === "weekly" || p.cycleMode === "payday") ? p.cycleMode : "auto",
     weekStart: p.weekStart === 1 ? 1 : 0,
     autoBudget: typeof p.autoBudget === "boolean" ? p.autoBudget : true,
     // weekDays가 없으면 주 단위로 계산하던 옛 예산 → 버리고 새 방식으로 다시 잡게 둔다
@@ -215,10 +225,11 @@ const normalize = (p) => {
           type: r.type === "income" || r.type === "transfer" ? r.type : "expense",
           from: r.from ?? null,
           to: r.to ?? null,
-          src: r.src === "week" || r.src === "box" ? r.src : null,
           freq:
             r.freq?.kind === "weekly"
               ? { kind: "weekly", dow: Math.min(6, Math.max(0, Number(r.freq.dow) || 0)) }
+              : r.freq?.kind === "monthEnd"
+              ? { kind: "monthEnd" }
               : { kind: "monthly", day: Math.min(31, Math.max(1, Number(r.freq?.day) || 1)) },
           startDate: typeof r.startDate === "string" ? r.startDate : toISO(new Date()),
           active: r.active !== false,
@@ -255,7 +266,7 @@ const balanceOf = (d, a) => {
 const budgetWindow = (d) => {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const weekly = d.cycleMode === "weekly";
+  const weekly = effectiveCycle(d) === "weekly";
   let end;
   if (weekly) {
     end = startOfWeek(today, d.weekStart);
@@ -413,12 +424,10 @@ export default function MoneyBoard() {
   const [eAmt, setEAmt] = useState("");
   const [eText, setEText] = useState("");
   const [eDate, setEDate] = useState(toISO(new Date()));
-  const [eSrc, setESrc] = useState("week");
-  const [eKind, setEKind] = useState("expense");
-  const [eAcct, setEAcct] = useState("");
+  const [eKind, setEKind] = useState("expense"); // expense | income | transfer
+  const [eFrom, setEFrom] = useState("");
+  const [eTo, setETo] = useState("");
   const [entryEdit, setEntryEdit] = useState(null);
-  const [showPull, setShowPull] = useState(false);
-  const [pullAmt, setPullAmt] = useState("");
   const [ruleEdit, setRuleEdit] = useState(null);
   const [pMonth, setPMonth] = useState("");
   const [pAmt, setPAmt] = useState("");
@@ -498,19 +507,16 @@ export default function MoneyBoard() {
   const acct = (id) => data.accounts.find((a) => a.id === id);
   const acctName = (id) => acct(id)?.name ?? "—";
   const spendAcc = data.accounts.find((a) => a.role === "spend");
-  const saveAcc = data.accounts.find((a) => a.role === "save");
+  const cycle = effectiveCycle(data);
 
   const budget = data.autoBudget ? data.budget?.amount ?? 0 : data.weeklyBudget;
-  const isSpend = (e, s) => e.type === "expense" && e.src === s;
-  const weekSpent = data.entries.filter((e) => isSpend(e, "week") && inThisWeek(e.date)).reduce((s, e) => s + e.amount, 0);
+  // 주간 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
+  const fromSpend = (e) => e.type === "expense" && spendAcc && e.from === spendAcc.id;
+  const weekSpent = data.entries.filter((e) => fromSpend(e) && inThisWeek(e.date)).reduce((s, e) => s + e.amount, 0);
   const remaining = Math.round(budget - weekSpent);
   const over = remaining < 0;
   const daysLeftWeek = 7 - ((nowD.getDay() - data.weekStart + 7) % 7);
   const perDay = Math.max(remaining, 0) / daysLeftWeek;
-  const todaySpent = data.entries.filter((e) => e.type === "expense" && e.date === todayISO).reduce((s, e) => s + e.amount, 0);
-
-  const boxTotal = data.accounts.filter((a) => a.role === "save").reduce((s, a) => s + bal(a), 0);
-  const boxUsed = data.entries.filter((e) => isSpend(e, "box")).reduce((s, e) => s + e.amount, 0);
 
   const cashTotal = data.accounts.filter((a) => a.role !== "invest").reduce((s, a) => s + bal(a), 0);
   const investTotal = data.accounts.filter((a) => a.role === "invest").reduce((s, a) => s + bal(a), 0);
@@ -520,8 +526,8 @@ export default function MoneyBoard() {
   const cycleLast = new Date(cycleEnd);
   cycleLast.setDate(cycleLast.getDate() - 1);
   const inCycle = (iso) => iso >= toISO(cycleStart) && iso < toISO(cycleEnd);
-  const cycleWeek = data.entries.filter((e) => isSpend(e, "week") && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
-  const cycleBox = data.entries.filter((e) => isSpend(e, "box") && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
+  const cycleSpend = data.entries.filter((e) => fromSpend(e) && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
+  const cycleAll = data.entries.filter((e) => e.type === "expense" && inCycle(e.date)).reduce((s, e) => s + e.amount, 0);
 
   const pay = paydayInfo(data.payday);
 
@@ -563,40 +569,26 @@ export default function MoneyBoard() {
     setEditPay(false);
   };
 
-  const incomeAcctId = eAcct || data.accounts[0]?.id || null;
+  const fallbackId = data.accounts[0]?.id ?? null;
+  const fromId = eFrom || spendAcc?.id || fallbackId;
+  const toId = eTo || fallbackId;
+  const kindLabel = { expense: "지출", income: "수입", transfer: "이체" };
 
   const addEntry = () => {
     const n = parseWon(eAmt);
     if (!n || n <= 0) return;
-    const income = eKind === "income";
     const entry = {
       id: uid(), ts: Date.now(), date: eDate || todayISO,
-      type: income ? "income" : "expense",
+      type: eKind,
       amount: n,
-      text: eText.trim() || (income ? "수입" : "지출"),
-      from: income ? null : (eSrc === "box" ? saveAcc?.id : spendAcc?.id) ?? null,
-      to: income ? incomeAcctId : null,
-      src: income ? null : eSrc,
+      text: eText.trim() || kindLabel[eKind],
+      from: eKind === "income" ? null : fromId,
+      to: eKind === "expense" ? null : toId,
       auto: false, ruleId: null,
     };
     upEntries((d) => { d.entries.unshift(entry); d.entries = d.entries.slice(0, 500); return d; });
     setEAmt(""); setEText("");
-    setEKind("expense"); // 수입 모드가 남아 다음 지출까지 수입으로 잡히는 걸 막는다
-  };
-
-  const pullFromBox = () => {
-    const n = parseWon(pullAmt);
-    if (!n || n <= 0 || !saveAcc || !spendAcc) return;
-    upEntries((d) => {
-      d.entries.unshift({
-        id: uid(), ts: Date.now(), date: todayISO, type: "transfer", amount: n,
-        text: `${saveAcc.name} → ${spendAcc.name}`, from: saveAcc.id, to: spendAcc.id,
-        src: null, auto: false, ruleId: null,
-      });
-      d.entries = d.entries.slice(0, 500);
-      return d;
-    });
-    setPullAmt(""); setShowPull(false);
+    setEKind("expense"); // 수입·이체 모드가 남아 다음 지출까지 잘못 잡히는 걸 막는다
   };
 
   const removeEntry = (id) => upEntries((d) => { d.entries = d.entries.filter((x) => x.id !== id); return d; });
@@ -604,7 +596,7 @@ export default function MoneyBoard() {
   const startEntryEdit = (e) =>
     setEntryEdit({
       id: e.id, date: e.date, amt: String(e.amount), text: e.text, type: e.type,
-      src: e.src ?? "week", to: e.to ?? incomeAcctId,
+      from: e.from ?? fromId, to: e.to ?? toId,
     });
 
   const saveEntryEdit = () => {
@@ -615,12 +607,9 @@ export default function MoneyBoard() {
       if (!e) return d;
       e.date = entryEdit.date || e.date;
       e.amount = n;
-      e.text = entryEdit.text.trim() || (e.type === "income" ? "수입" : "지출");
-      if (e.type === "income") e.to = entryEdit.to;
-      else {
-        e.src = entryEdit.src;
-        e.from = (entryEdit.src === "box" ? saveAcc?.id : spendAcc?.id) ?? null;
-      }
+      e.text = entryEdit.text.trim() || kindLabel[e.type];
+      e.from = e.type === "income" ? null : entryEdit.from;
+      e.to = e.type === "expense" ? null : entryEdit.to;
       return d;
     });
     setEntryEdit(null);
@@ -628,10 +617,19 @@ export default function MoneyBoard() {
 
   const newRule = () => ({
     id: uid(), name: "", amount: "", type: "expense",
-    from: spendAcc?.id ?? data.accounts[0]?.id ?? null,
-    to: data.accounts[0]?.id ?? null,
-    src: null, freq: { kind: "monthly", day: 1 }, startDate: todayISO, active: true, isNew: true,
+    from: spendAcc?.id ?? fallbackId,
+    to: fallbackId,
+    freq: { kind: "monthly", day: 1 }, startDate: todayISO, active: true, isNew: true,
   });
+
+  /* 고정 항목이 바뀌면 입금 주기 자동 판정이 뒤집힐 수 있어, 그때는 예산을 다시 잡는다 */
+  const upRules = (fn) =>
+    setData((prev) => {
+      const before = effectiveCycle(prev);
+      const d = fn(structuredClone(prev));
+      if (effectiveCycle(d) !== before) d.budget = null;
+      return d;
+    });
 
   const saveRule = () => {
     const n = parseWon(ruleEdit.amount);
@@ -640,10 +638,9 @@ export default function MoneyBoard() {
       id: ruleEdit.id, name: ruleEdit.name.trim(), amount: n, type: ruleEdit.type,
       from: ruleEdit.type === "income" ? null : ruleEdit.from,
       to: ruleEdit.type === "expense" ? null : ruleEdit.to,
-      src: ruleEdit.type === "expense" ? ruleEdit.src : null,
       freq: ruleEdit.freq, startDate: ruleEdit.startDate, active: ruleEdit.active,
     };
-    up((d) => {
+    upRules((d) => {
       const i = d.rules.findIndex((x) => x.id === r.id);
       if (i >= 0) d.rules[i] = r; else d.rules.push(r);
       return d;
@@ -751,7 +748,7 @@ export default function MoneyBoard() {
             <Row align="items-start">
               <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산 근거</span>
               <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
-                {data.cycleMode === "weekly"
+                {cycle === "weekly"
                   ? `${fmt(data.budget.balance)} 전액`
                   : `${fmt(data.budget.balance)} ÷ ${data.budget.days}일 × ${data.budget.weekDays}일`}
                 {data.budget.until && ` (${md(fromISO(data.budget.until))}까지)`}
@@ -761,9 +758,17 @@ export default function MoneyBoard() {
           )}
           <Row>
             <span className="text-[15px] flex-1">입금 주기</span>
-            <Seg options={[["payday", "급여일마다"], ["weekly", "매주"]]} value={data.cycleMode}
+            <Seg options={[["auto", "자동"], ["weekly", "매주"], ["payday", "급여일"]]} value={data.cycleMode}
               onChange={(k) => up((d) => { d.cycleMode = k; d.budget = null; return d; })} />
           </Row>
+          {data.cycleMode === "auto" && (
+            <Row>
+              <span className="text-[13px] flex-1" style={{ color: C.sub }}>자동 판정</span>
+              <span className="text-[13px]" style={{ color: C.sub }}>
+                {cycle === "weekly" ? "매주 — 쓸돈으로 들어오는 매주 고정 항목 있음" : "급여일마다"}
+              </span>
+            </Row>
+          )}
           <Row>
             <span className="text-[15px] flex-1">주 시작</span>
             <Seg options={[[0, "일"], [1, "월"]]} value={data.weekStart}
@@ -772,50 +777,40 @@ export default function MoneyBoard() {
 
           {/* 입력 */}
           <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
-            <Seg options={[["expense", "지출"], ["income", "수입"]]} value={eKind} onChange={setEKind} />
+            <Seg options={[["expense", "지출"], ["income", "수입"], ["transfer", "이체"]]} value={eKind} onChange={setEKind} />
             <div className="flex flex-wrap gap-2 mt-2.5">
               <Field type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className="text-[13px]" />
               <Field value={eAmt} onChange={(e) => setEAmt(e.target.value)} placeholder="금액" inputMode="decimal"
                 onKeyDown={(e) => e.key === "Enter" && addEntry()} className="w-28 tabular-nums" />
               <Field value={eText} onChange={(e) => setEText(e.target.value)}
-                placeholder={eKind === "income" ? "내용 (예: 월급)" : "내용 (예: 점심)"}
+                placeholder={eKind === "income" ? "내용 (예: 월급)" : eKind === "transfer" ? "내용 (예: 생활비 이체)" : "내용 (예: 점심)"}
                 onKeyDown={(e) => e.key === "Enter" && addEntry()} className="flex-1 min-w-[110px]" />
             </div>
-            <div className="flex items-center gap-2 mt-2.5">
-              {eKind === "income"
-                ? <AcctSelect value={incomeAcctId} onChange={setEAcct} />
-                : <Seg options={[["week", "쓸돈"], ["box", "박스"]]} value={eSrc} onChange={setESrc} />}
+            <div className="flex flex-wrap items-center gap-2 mt-2.5">
+              {eKind !== "income" && (
+                <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
+                  출금 <AcctSelect value={fromId} onChange={setEFrom} />
+                </span>
+              )}
+              {eKind !== "expense" && (
+                <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
+                  입금 <AcctSelect value={toId} onChange={setETo} />
+                </span>
+              )}
               <button onClick={addEntry}
                 className="ml-auto text-[15px] px-4 py-2 rounded-[10px] font-medium"
                 style={{ background: C.accent, color: "#fff" }}>
                 적기
               </button>
             </div>
+            {eKind === "expense" && (
+              <div className="text-[13px] mt-2" style={{ color: C.sub }}>
+                {spendAcc && fromId === spendAcc.id
+                  ? "주간 예산에서 빠져요."
+                  : "'쓸돈' 계좌가 아니라 주간 예산에는 안 잡혀요."}
+              </div>
+            )}
           </div>
-        </Card>
-
-        {/* 세이프박스 */}
-        <Card title="세이프박스">
-          <div className="pt-3 pb-1">
-            <div className="text-[13px]" style={{ color: C.sub }}>남은 돈</div>
-            <div className="text-[28px] leading-none font-semibold tabular-nums tracking-tight mt-1">{fmt(boxTotal)}</div>
-            <div className="text-[13px] mt-2" style={{ color: C.sub }}>지금까지 {fmt(boxUsed)} 씀</div>
-          </div>
-          {showPull ? (
-            <Row>
-              <Field autoFocus value={pullAmt} onChange={(e) => setPullAmt(e.target.value)} placeholder="금액" inputMode="decimal"
-                onKeyDown={(e) => { if (e.key === "Enter") pullFromBox(); if (e.key === "Escape") { setShowPull(false); setPullAmt(""); } }}
-                className="flex-1 tabular-nums" />
-              <button onClick={pullFromBox} className="text-[15px] px-3.5 py-2 rounded-[10px] font-medium"
-                style={{ background: C.accent, color: "#fff" }}>옮기기</button>
-              <button onClick={() => { setShowPull(false); setPullAmt(""); }}
-                className="text-[15px]" style={{ color: C.sub }}>취소</button>
-            </Row>
-          ) : (
-            <Row onClick={() => setShowPull(true)}>
-              <span className="text-[15px]" style={{ color: C.accent }}>쓸돈 계좌로 끌어오기</span>
-            </Row>
-          )}
         </Card>
 
         </>)}
@@ -871,17 +866,13 @@ export default function MoneyBoard() {
                   </span>
                 )}
               </div>
-              {ruleEdit.type === "expense" && (
-                <div className="flex items-center gap-2 mt-2.5 text-[13px]" style={{ color: C.sub }}>
-                  예산 귀속
-                  <Seg options={[[null, "예산 밖"], ["week", "쓸돈"], ["box", "박스"]]}
-                    value={ruleEdit.src} onChange={(k) => setRuleEdit({ ...ruleEdit, src: k })} />
-                </div>
-              )}
               <div className="flex flex-wrap items-center gap-2 mt-2.5">
-                <Seg options={[["monthly", "매월"], ["weekly", "매주"]]} value={ruleEdit.freq.kind}
-                  onChange={(k) => setRuleEdit({ ...ruleEdit, freq: k === "weekly" ? { kind: "weekly", dow: 1 } : { kind: "monthly", day: 1 } })} />
-                {ruleEdit.freq.kind === "monthly" ? (
+                <Seg options={[["monthly", "매월"], ["monthEnd", "말일"], ["weekly", "매주"]]} value={ruleEdit.freq.kind}
+                  onChange={(k) => setRuleEdit({
+                    ...ruleEdit,
+                    freq: k === "weekly" ? { kind: "weekly", dow: 1 } : k === "monthEnd" ? { kind: "monthEnd" } : { kind: "monthly", day: 1 },
+                  })} />
+                {ruleEdit.freq.kind === "monthEnd" ? null : ruleEdit.freq.kind === "monthly" ? (
                   <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
                     <Field type="number" min={1} max={31} value={ruleEdit.freq.day}
                       onChange={(e) => setRuleEdit({ ...ruleEdit, freq: { kind: "monthly", day: Math.min(31, Math.max(1, Number(e.target.value) || 1)) } })}
@@ -904,7 +895,7 @@ export default function MoneyBoard() {
                 <Seg options={[[true, "사용"], [false, "중지"]]} value={ruleEdit.active}
                   onChange={(k) => setRuleEdit({ ...ruleEdit, active: k })} />
                 {!ruleEdit.isNew && (
-                  <button onClick={() => { up((d) => { d.rules = d.rules.filter((x) => x.id !== ruleEdit.id); return d; }); setRuleEdit(null); }}
+                  <button onClick={() => { upRules((d) => { d.rules = d.rules.filter((x) => x.id !== ruleEdit.id); return d; }); setRuleEdit(null); }}
                     style={{ color: C.danger }} title="삭제"><Trash2 size={17} /></button>
                 )}
                 <button onClick={() => setRuleEdit(null)} className="ml-auto text-[15px]" style={{ color: C.sub }}>취소</button>
@@ -941,7 +932,7 @@ export default function MoneyBoard() {
               이번 사이클 {md(cycleStart)} – {md(cycleLast)}
             </span>
             <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>
-              쓸돈 {fmt(cycleWeek)} · 박스 {fmt(cycleBox)}
+              쓸돈 {fmt(cycleSpend)} · 전체 {fmt(cycleAll)}
             </span>
           </Row>
           {weekKeys.length === 0 && (
@@ -951,7 +942,7 @@ export default function MoneyBoard() {
             const wkStart = fromISO(wk);
             const wkEnd = new Date(wkStart); wkEnd.setDate(wkEnd.getDate() + 6);
             const list = byWeek[wk];
-            const wWeek = list.filter((e) => isSpend(e, "week")).reduce((s, e) => s + e.amount, 0);
+            const wWeek = list.filter(fromSpend).reduce((s, e) => s + e.amount, 0);
             const dates = [...new Set(list.map((e) => e.date))].sort().reverse();
             return (
               <div key={wk}>
@@ -979,26 +970,30 @@ export default function MoneyBoard() {
                               onKeyDown={(ev) => { if (ev.key === "Enter") saveEntryEdit(); if (ev.key === "Escape") setEntryEdit(null); }}
                               className="flex-1 min-w-[110px]" />
                           </div>
-                          <div className="flex items-center gap-2 mt-2.5">
-                            {entryEdit.type === "income"
-                              ? <AcctSelect value={entryEdit.to} onChange={(v) => setEntryEdit({ ...entryEdit, to: v })} />
-                              : <Seg options={[["week", "쓸돈"], ["box", "박스"]]} value={entryEdit.src}
-                                  onChange={(k) => setEntryEdit({ ...entryEdit, src: k })} />}
+                          <div className="flex flex-wrap items-center gap-2 mt-2.5">
+                            {entryEdit.type !== "income" && (
+                              <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
+                                출금 <AcctSelect value={entryEdit.from} onChange={(v) => setEntryEdit({ ...entryEdit, from: v })} />
+                              </span>
+                            )}
+                            {entryEdit.type !== "expense" && (
+                              <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
+                                입금 <AcctSelect value={entryEdit.to} onChange={(v) => setEntryEdit({ ...entryEdit, to: v })} />
+                              </span>
+                            )}
                             <button onClick={() => setEntryEdit(null)} className="ml-auto text-[15px]" style={{ color: C.sub }}>취소</button>
                             <button onClick={saveEntryEdit} className="text-[15px] px-4 py-2 rounded-[10px] font-medium"
                               style={{ background: C.accent, color: "#fff" }}>저장</button>
                           </div>
                         </div>
                       ) : (
-                        <Row key={e.id} first={i === 0}
-                          onClick={e.type === "transfer" ? undefined : () => startEntryEdit(e)}>
+                        <Row key={e.id} first={i === 0} onClick={() => startEntryEdit(e)}>
                           <span className="text-[15px] flex-1 min-w-0 truncate"
                             style={{ color: e.type === "transfer" ? C.sub : C.text }}>{e.text}</span>
                           {e.auto && <Tag>자동</Tag>}
                           {e.type === "income" && <Tag tone="accent">{acctName(e.to)}</Tag>}
                           {e.type === "transfer" && <Tag>이체</Tag>}
-                          {e.type === "expense" && e.src === "box" && <Tag>박스</Tag>}
-                          {e.type === "expense" && e.src == null && <Tag>예산 밖</Tag>}
+                          {e.type === "expense" && !fromSpend(e) && <Tag>{acctName(e.from)}</Tag>}
                           <span className="text-[15px] tabular-nums"
                             style={{ color: e.type === "income" ? C.accent : e.type === "transfer" ? C.sub : C.text }}>
                             {e.type === "income" ? "+" : e.type === "transfer" ? "→" : "−"}{fmt(e.amount)}
