@@ -47,7 +47,9 @@ export default defineConfig({
         // 새 버전을 기다리지 않고 바로 넘긴다 — 폰에 옛 화면이 남는 걸 막는다
         skipWaiting: true,
         clientsClaim: true,
-        cleanupOutdatedCaches: true
+        cleanupOutdatedCaches: true,
+        // OAuth 콜백은 캐시된 index.html로 대체하지 않고 항상 네트워크로 보낸다
+        navigateFallbackDenylist: [/[?&](code|state|error|error_description)=/]
       }
     })
   ]

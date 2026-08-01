@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { Plus, Trash2, RotateCcw, Check, Pencil } from "lucide-react";
-import { supabase, serverEnabled } from "./supabase";
+import { supabase, serverEnabled, readAuthCallback, cleanAuthParams } from "./supabase";
 import Login from "./Login";
 import { push, pullMerge, uploadAll, saveSnap, clearSnap, computeChanges, hasChanges, hasLocalContent } from "./sync";
 
@@ -414,6 +414,7 @@ export default function MoneyBoard() {
   const [sendAmt, setSendAmt] = useState("");
   const [showFuture, setShowFuture] = useState(false);
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
+  const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
   const [askUpload, setAskUpload] = useState(false);
   const [updateReady, setUpdateReady] = useState(false);
@@ -438,13 +439,25 @@ export default function MoneyBoard() {
     loaded.current = true;
   }, []);
 
-  /* 로그인 상태 추적 — 서버를 안 쓰면 아무것도 하지 않는다 */
+  /* 로그인 상태 추적 + OAuth 콜백 뒷정리 — 서버를 안 쓰면 아무것도 하지 않는다 */
   useEffect(() => {
     if (!serverEnabled) { setSession(null); return; }
-    supabase.auth.getSession().then(({ data: s }) => setSession(s.session ?? null));
+    const cb = readAuthCallback(); // 돌아온 URL에 code/토큰/에러가 있는지
+    if (cb.error) setAuthError(cb.error);
+
+    // createClient 가 detectSessionInUrl 로 이미 교환을 시작했으므로 결과만 기다린다
+    supabase.auth.getSession().then(({ data: s }) => {
+      setSession(s.session ?? null);
+      if (cb.code || cb.token || cb.error) cleanAuthParams(); // 주소창에서 파라미터 제거
+      if ((cb.code || cb.token) && !s.session && !cb.error) {
+        setAuthError("구글에서 돌아왔지만 세션을 만들지 못했어요. 다시 시도해 주세요.");
+      }
+    });
+
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
       setSession(s ?? null);
-      if (!s) { pulled.current = false; clearSnap(); }
+      if (s) setAuthError("");
+      else { pulled.current = false; clearSnap(); }
     });
     return () => sub.subscription.unsubscribe();
   }, []);
@@ -559,7 +572,7 @@ export default function MoneyBoard() {
       </div>
     );
 
-  if (serverEnabled && !session) return <Login />;
+  if (serverEnabled && !session) return <Login error={authError} />;
 
   /* ── 파생값 ── */
   const up = (fn) => setData((d) => fn(structuredClone(d)));

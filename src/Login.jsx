@@ -6,15 +6,25 @@ const C = {
   sub: "var(--sub)", line: "var(--line)", field: "var(--field)", accent: "var(--accent)",
 };
 
-export default function Login() {
+export default function Login({ error = "" }) {
   const [email, setEmail] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const shown = msg || error; // 콜백에서 돌아온 실패 사유도 그대로 보여준다
 
   const google = async () => {
     setBusy(true);
-    const { error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo } });
-    if (error) { setMsg(error.message); setBusy(false); }
+    setMsg("");
+    try {
+      const { error: e } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo },
+      });
+      if (e) { setMsg(e.message); setBusy(false); }
+    } catch (e) {
+      setMsg(String(e?.message ?? e));
+      setBusy(false);
+    }
   };
 
   const magic = async () => {
@@ -56,7 +66,14 @@ export default function Login() {
           </div>
         </div>
 
-        {msg && <p className="text-[13px] mt-3 px-1" style={{ color: C.sub }}>{msg}</p>}
+        {shown && (
+          <p className="text-[13px] mt-3 px-1 leading-5" style={{ color: error && !msg ? "var(--danger)" : C.sub }}>
+            {shown}
+          </p>
+        )}
+        <p className="text-[12px] mt-4 px-1" style={{ color: C.sub }}>
+          돌아올 주소: {redirectTo}
+        </p>
       </div>
     </div>
   );
