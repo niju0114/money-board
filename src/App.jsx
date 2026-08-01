@@ -34,10 +34,9 @@ const SEED = {
   unit: "won",
   payday: 25,
   weekStart: 0, // 주 시작 요일 — 가계부 묶음에만 쓴다 (0=일, 1=월)
-  saveGoal: 0, // 이번 사이클 목표 저축액 — 급여일이 지나도 유지된다
-  menus: [], // 개인 데이터는 시드에 두지 않는다
+  appName: "내 돈", // 화면 제목 — 사용자가 바꾼다
   saveGoal: 0, // 이번 사이클에 남기고 싶은 금액 (사이클이 바뀌어도 유지)
-  menus: [], // 공개 저장소이므로 개인 메뉴는 넣지 않는다
+  menus: [], // 공개 저장소이므로 개인 데이터는 시드에 두지 않는다
   accounts: [
     { id: "a1", name: "주계좌", note: "수입이 들어오는 곳", baseAmount: 0, baseTs: 0, role: "hub" },
     { id: "a2", name: "세이프박스", note: "일정 없이 꺼내 쓰는 돈", baseAmount: 0, baseTs: 0, role: "save" },
@@ -214,6 +213,8 @@ const normalize = (p) => {
       auto: e.auto === true,
       ruleId: e.ruleId ?? null,
       savedFrom: e.savedFrom === true, // '아낀 돈 → 투자'로 보낸 이체 표시
+      value: e.value === "good" || e.value === "waste" ? e.value : null, // 기본은 미분류
+      special: e.special === true, // 여행·공연처럼 일상과 다른 지출
     };
   });
 
@@ -223,6 +224,7 @@ const normalize = (p) => {
     unit: "won",
     payday: Number.isFinite(p.payday) ? p.payday : SEED.payday,
     weekStart: p.weekStart === 1 ? 1 : 0,
+    appName: typeof p.appName === "string" && p.appName.trim() ? p.appName : SEED.appName,
     saveGoal: Math.max(0, cv(p.saveGoal)),
     menus: Array.isArray(p.menus)
       ? p.menus.map((m) => ({ id: m.id ?? uid(), name: m.name ?? "메뉴", price: Math.max(0, cv(m.price)) }))
@@ -414,6 +416,8 @@ export default function MoneyBoard() {
   const [sendAmt, setSendAmt] = useState("");
   const [showFuture, setShowFuture] = useState(false);
   const [showSaved, setShowSaved] = useState(false);
+  const [showBudgetDetail, setShowBudgetDetail] = useState(false);
+  const [goalEdit, setGoalEdit] = useState(null); // null 이면 보기 상태
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
   const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
@@ -615,6 +619,20 @@ export default function MoneyBoard() {
   // 지금 멈추면 내일 예산 — 오늘 끝 잔액을 하루 줄어든 날수로 나눈다
   const tomorrowBudget = perDayFrom(Math.max(0, spendBal - saveGoal), pay.days - 1);
   const weekEstimate = todayBudget * 7;
+
+  /* 목표를 입력하는 중에 하루 예산이 얼마가 되는지 미리 보여준다 */
+  const goalPreview = (() => {
+    const want = Math.max(0, parseWon(goalEdit ?? "") ?? 0);
+    const capped = want > dayBase;
+    const g = capped ? Math.floor(dayBase * 0.8) : want;
+    return { goal: g, capped, budget: perDayFrom(Math.max(0, dayBase - g), pay.days) };
+  })();
+
+  const commitGoal = () => {
+    const n = parseWon(goalEdit ?? "");
+    up((d) => { d.saveGoal = Math.max(0, n ?? 0); return d; });
+    setGoalEdit(null);
+  };
   // 계획대로 쓰면 사이클 끝에 남을 돈 — 목표와의 차이로 앞서는지 뒤처지는지 본다
   const paceDiff = spendBal - todayBudget * pay.days - saveGoal;
 
@@ -672,7 +690,8 @@ export default function MoneyBoard() {
   const savedDays = [...new Set(data.entries.filter((e) => fromSpend(e) && e.date < todayISO).map((e) => e.date))]
     .sort()
     .map((iso) => {
-      const dayBudget = perDayFrom(spendBalanceOn(iso), daysToPayFrom(iso));
+      // 오늘 예산과 기준을 맞추기 위해 지난 날에도 현재 목표 저축액을 빼고 계산한다
+      const dayBudget = perDayFrom(Math.max(0, spendBalanceOn(iso) - saveGoal), daysToPayFrom(iso));
       const spent = spentOn(iso);
       return { iso, budget: dayBudget, spent, diff: dayBudget - spent };
     });
@@ -953,7 +972,7 @@ export default function MoneyBoard() {
         {/* 헤더 */}
         <header className="flex items-start justify-between px-1">
           <div>
-            <h1 className="text-[28px] font-semibold tracking-tight leading-tight">민준의 돈</h1>
+            <h1 className="text-[28px] font-semibold tracking-tight leading-tight">{data.appName}</h1>
             <div className="text-[13px] mt-0.5" style={{ color: C.sub }}>
               {serverEnabled
                 ? syncState === "syncing" ? "전송 중…"
@@ -1129,6 +1148,7 @@ export default function MoneyBoard() {
                       style={{ color: d.diff < 0 ? C.danger : C.text }}>{fmt(d.diff)}</span>
                   </Row>
                 ))}
+                <Row><span className="text-[13px]" style={{ color: C.sub }}>현재 목표 기준</span></Row>
               </>
             )
           )}
@@ -1150,62 +1170,95 @@ export default function MoneyBoard() {
 
         {/* 예산 */}
         <Card title="하루 예산">
-          <Row first>
+          <Row first onClick={() => setShowBudgetDetail(!showBudgetDetail)}>
             <span className="text-[15px] flex-1">오늘 예산</span>
             <span className="text-[15px] tabular-nums">{fmt(todayBudget)}</span>
+            <span className="text-[13px]" style={{ color: C.accent }}>{showBudgetDetail ? "접기" : "자세히"}</span>
           </Row>
-          <Row>
-            <span className="text-[15px] flex-1">목표 저축액</span>
-            <Amount value={data.saveGoal} className="text-[15px]"
-              onCommit={(n) => up((d) => { d.saveGoal = Math.max(0, n); return d; })} />
-          </Row>
-          {goalCapped && (
+          {showBudgetDetail && (
+            <>
+              <Row align="items-start">
+                <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산</span>
+                <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
+                  {saveGoal > 0
+                    ? `${fmt(dayBase)} − ${fmt(saveGoal)} = ${fmt(budgetBase)} ÷ ${spreadDays}일`
+                    : `${fmt(dayBase)} ÷ ${spreadDays}일`}
+                  {spreadDays !== pay.days && ` (최소 ${MIN_SPREAD_DAYS}일)`}
+                </span>
+              </Row>
+              {saveGoal > 0 && (
+                <Row>
+                  <span className="text-[13px] flex-1" style={{ color: C.sub }}>진행</span>
+                  <span className="text-[13px] tabular-nums" style={{ color: paceDiff >= 0 ? C.accent : C.danger }}>
+                    {paceDiff >= 0 ? `${fmt(paceDiff)} 앞섬` : `${fmt(-paceDiff)} 뒤짐`}
+                  </span>
+                </Row>
+              )}
+              <Row>
+                <span className="text-[13px] flex-1" style={{ color: C.sub }}>다음 입금</span>
+                <span className="text-[13px]" style={{ color: C.sub }}>{pay.label} · {pay.days}일</span>
+              </Row>
+              <Row align="items-start">
+                <span className="text-[13px] shrink-0" style={{ color: C.sub }}>이번 사이클</span>
+                <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
+                  {md(cycleStart)}–{md(cycleLast)} · 쓸돈 {fmt(cycleSpend)} · 전체 {fmt(cycleAll)}
+                </span>
+              </Row>
+            </>
+          )}
+
+          {/* 목표 저축액 — 수정할 수 있다는 게 보이도록 */}
+          {goalEdit === null ? (
+            <Row onClick={() => setGoalEdit(String(data.saveGoal || ""))}>
+              <span className="text-[15px] flex-1">목표 저축액</span>
+              {data.saveGoal > 0 ? (
+                <span className="text-[15px] tabular-nums">{fmt(data.saveGoal)}</span>
+              ) : (
+                <span className="text-[15px]" style={{ color: C.accent }}>설정하기</span>
+              )}
+              <Pencil size={14} style={{ color: C.sub }} />
+            </Row>
+          ) : (
+            <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
+              <div className="flex items-center gap-2">
+                <Field autoFocus value={goalEdit} inputMode="decimal" placeholder="목표 저축액"
+                  onChange={(e) => setGoalEdit(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") commitGoal(); if (e.key === "Escape") setGoalEdit(null); }}
+                  className="flex-1 tabular-nums" />
+                <button onClick={commitGoal} className="text-[15px] px-3.5 py-2 rounded-[10px] font-medium"
+                  style={{ background: C.accent, color: "#fff" }}>저장</button>
+                <button onClick={() => setGoalEdit(null)} className="text-[15px]" style={{ color: C.sub }}>취소</button>
+              </div>
+              <div className="text-[13px] mt-2 tabular-nums" style={{ color: C.sub }}>
+                {fmt(goalPreview.goal)} 저축 → 하루 {fmt(goalPreview.budget)}
+                {goalPreview.capped && ` (잔액의 80%로 낮춤)`}
+              </div>
+            </div>
+          )}
+          {goalCapped && goalEdit === null && (
             <Row>
-              <span className="text-[13px]" style={{ color: C.danger }}>
-                목표가 쓸돈 잔액보다 커서 잔액의 80%({fmt(saveGoal)})로 낮춰 계산했어요.
+              <span className="text-[13px]" style={{ color: C.sub }}>
+                잔액보다 큰 목표라 {fmt(saveGoal)}로 낮춰 계산 중이에요.
               </span>
             </Row>
           )}
-          <Row align="items-start">
-            <span className="text-[13px] shrink-0" style={{ color: C.sub }}>계산 근거</span>
-            <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
-              {saveGoal > 0
-                ? `${fmt(dayBase)} − 목표 ${fmt(saveGoal)} = ${fmt(budgetBase)} ÷ ${spreadDays}일 = 하루 ${fmt(todayBudget)}`
-                : `${fmt(dayBase)} ÷ ${spreadDays}일 = 하루 ${fmt(todayBudget)}`}
-              {spreadDays !== pay.days && ` (최소 ${MIN_SPREAD_DAYS}일로 폄)`}
-            </span>
-          </Row>
-          {saveGoal > 0 && (
-            <Row>
-              <span className="text-[13px] flex-1" style={{ color: C.sub }}>진행</span>
-              <span className="text-[13px] tabular-nums" style={{ color: paceDiff >= 0 ? C.accent : C.danger }}>
-                목표 {fmt(saveGoal)} · {paceDiff >= 0 ? `${fmt(paceDiff)} 앞서는 중` : `${fmt(-paceDiff)} 뒤처짐`}
-              </span>
-            </Row>
-          )}
-          <Row>
-            <span className="text-[13px] flex-1" style={{ color: C.sub }}>다음 입금</span>
-            <span className="text-[13px]" style={{ color: C.sub }}>{pay.label} · {pay.days}일 남음</span>
-          </Row>
+
           <Row>
             <span className="text-[15px] flex-1">주 시작</span>
             <Seg options={[[0, "일"], [1, "월"]]} value={data.weekStart}
               onChange={(k) => up((d) => { d.weekStart = k; return d; })} />
           </Row>
-          <Row align="items-start">
-            <span className="text-[13px] shrink-0" style={{ color: C.sub }}>
-              이번 사이클 {md(cycleStart)} – {md(cycleLast)}
-            </span>
-            <span className="text-[13px] tabular-nums flex-1 text-right" style={{ color: C.sub }}>
-              쓸돈 {fmt(cycleSpend)} · 전체 {fmt(cycleAll)}
-            </span>
+          <Row>
+            <span className="text-[15px] flex-1">앱 이름</span>
+            <Field value={data.appName} className="w-40 text-[15px] text-right"
+              onChange={(e) => up((d) => { d.appName = e.target.value; return d; })} />
           </Row>
         </Card>
 
         {/* 내 메뉴 */}
         <Card title="내 메뉴">
           {data.menus.length === 0 && (
-            <Row first><span className="text-[15px]" style={{ color: C.sub }}>자주 먹는 것을 등록해 두면 오늘 살 수 있는지 바로 보여줘요.</span></Row>
+            <Row first><span className="text-[15px]" style={{ color: C.sub }}>아직 등록한 메뉴가 없어요.</span></Row>
           )}
           {data.menus.map((m, i) => (
             <Row key={m.id} first={i === 0}>
@@ -1321,7 +1374,7 @@ export default function MoneyBoard() {
             )}
           </Row>
           {data.rules.length === 0 && !ruleEdit && (
-            <Row><span className="text-[15px]" style={{ color: C.sub }}>자동이체·고정수입을 등록해 두면 날짜에 맞춰 기록돼요.</span></Row>
+            <Row><span className="text-[15px]" style={{ color: C.sub }}>아직 등록한 고정 항목이 없어요.</span></Row>
           )}
           {data.rules.map((r) => {
             const info = ruleInfo(r);

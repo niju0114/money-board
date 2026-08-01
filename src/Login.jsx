@@ -41,7 +41,7 @@ export default function Login({ error = "" }) {
   return (
     <div className="min-h-screen flex items-center justify-center px-4" style={{ background: C.bg, color: C.text }}>
       <div className="w-full max-w-sm">
-        <h1 className="text-[28px] font-semibold tracking-tight">민준의 돈</h1>
+        <h1 className="text-[28px] font-semibold tracking-tight">내 돈</h1>
         <p className="text-[15px] mt-1" style={{ color: C.sub }}>로그인하면 기기가 바뀌어도 기록이 따라와요.</p>
 
         <div className="rounded-2xl mt-6 px-4 py-2" style={{ background: C.card }}>
