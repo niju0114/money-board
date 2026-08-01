@@ -18,12 +18,14 @@ const entToRow = (e, uid) => ({
   amount: Math.round(e.amount) || 0, text: e.text ?? "",
   from_account: e.from ?? null, to_account: e.to ?? null,
   auto: !!e.auto, rule_id: e.ruleId ?? null, saved_from: !!e.savedFrom,
+  value: e.value ?? null, special: !!e.special,
 });
 const rowToEnt = (r) => ({
   id: r.id, ts: Number(r.ts) || 0, date: r.date, type: r.type,
   amount: Number(r.amount) || 0, text: r.text ?? "",
   from: r.from_account ?? null, to: r.to_account ?? null,
   auto: !!r.auto, ruleId: r.rule_id ?? null, savedFrom: !!r.saved_from,
+  value: r.value === "good" || r.value === "waste" ? r.value : null, special: !!r.special,
 });
 
 const ruleToRow = (r, uid) => ({

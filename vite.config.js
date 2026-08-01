@@ -27,8 +27,8 @@ export default defineConfig({
       registerType: "autoUpdate",
       manifest: {
         id: "/money-board/",
-        name: "민준의 돈",
-        short_name: "민준의 돈",
+        name: "내 돈",
+        short_name: "내 돈",
         description: "개인 원장 — 하루 예산·가계부·계좌를 한 화면에",
         lang: "ko",
         start_url: "/money-board/",

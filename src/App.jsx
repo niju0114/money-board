@@ -418,6 +418,8 @@ export default function MoneyBoard() {
   const [showSaved, setShowSaved] = useState(false);
   const [showBudgetDetail, setShowBudgetDetail] = useState(false);
   const [goalEdit, setGoalEdit] = useState(null); // null 이면 보기 상태
+  const [eSpecial, setESpecial] = useState(false);
+  const [showWaste, setShowWaste] = useState(false);
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
   const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
@@ -597,7 +599,26 @@ export default function MoneyBoard() {
   const isPast = (e) => e.date <= todayISO;
   // 하루 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
   const fromSpend = (e) => e.type === "expense" && spendAcc && e.from === spendAcc.id;
-  const spentOn = (iso) => data.entries.filter((e) => fromSpend(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
+  // 특별 지출(여행·공연 등)은 일상 페이스를 흔들지 않도록 예산 계산에서 뺀다.
+  // 잔액에는 그대로 반영되므로 실제 돈은 정확하다
+  const daily = (e) => fromSpend(e) && !e.special;
+  const spentOn = (iso) => data.entries.filter((e) => daily(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
+
+  const cycleStart = new Date(nowD.getFullYear(), nowD.getMonth() - (nowD.getDate() < data.payday ? 1 : 0), data.payday);
+  const cycleEnd = new Date(cycleStart.getFullYear(), cycleStart.getMonth() + 1, data.payday);
+  const cycleLast = new Date(cycleEnd);
+  cycleLast.setDate(cycleLast.getDate() - 1);
+  const inCycle = (iso) => iso >= toISO(cycleStart) && iso < toISO(cycleEnd);
+
+  // 이번 사이클의 특별 지출은 분자에서 되돌려 하루 예산이 흔들리지 않게 한다
+  const specialBefore = (iso) =>
+    data.entries
+      .filter((e) => fromSpend(e) && e.special && inCycle(e.date) && e.date < iso)
+      .reduce((s, e) => s + e.amount, 0);
+  const specialToday = data.entries
+    .filter((e) => fromSpend(e) && e.special && inCycle(e.date) && e.date === todayISO)
+    .reduce((s, e) => s + e.amount, 0);
+
   const weekSpent = data.entries
     .filter((e) => fromSpend(e) && isPast(e) && inThisWeek(e.date))
     .reduce((s, e) => s + e.amount, 0);
@@ -607,7 +628,7 @@ export default function MoneyBoard() {
   const todaySpent = spentOn(todayISO);
   // 오늘 지출은 분자에서 되돌려 하루 시작 시점 값으로 고정한다 —
   // 오늘 쓸수록 오늘 예산 자체가 줄어드는 일을 막는다
-  const dayBase = spendBal + todaySpent;
+  const dayBase = spendBal + todaySpent + specialBefore(todayISO) + specialToday;
   const spreadDays = Math.max(MIN_SPREAD_DAYS, pay.days);
   // 목표가 잔액보다 크면 쓸 돈이 없어지므로 잔액의 80%로 제한한다
   const goalCapped = data.saveGoal > dayBase;
@@ -643,11 +664,6 @@ export default function MoneyBoard() {
   const pensionTotal = data.accounts.filter((a) => a.role === "pension").reduce((s, a) => s + bal(a), 0);
   const investAcc = data.accounts.find((a) => a.role === "invest");
 
-  const cycleStart = new Date(nowD.getFullYear(), nowD.getMonth() - (nowD.getDate() < data.payday ? 1 : 0), data.payday);
-  const cycleEnd = new Date(cycleStart.getFullYear(), cycleStart.getMonth() + 1, data.payday);
-  const cycleLast = new Date(cycleEnd);
-  cycleLast.setDate(cycleLast.getDate() - 1);
-  const inCycle = (iso) => iso >= toISO(cycleStart) && iso < toISO(cycleEnd);
   const cycleSpend = data.entries
     .filter((e) => fromSpend(e) && isPast(e) && inCycle(e.date))
     .reduce((s, e) => s + e.amount, 0);
@@ -687,11 +703,15 @@ export default function MoneyBoard() {
   };
 
   // 지출을 적은 지난 날들만 모은다 (오늘과 미래는 제외)
-  const savedDays = [...new Set(data.entries.filter((e) => fromSpend(e) && e.date < todayISO).map((e) => e.date))]
+  // 특별 지출만 있는 날은 '일상 지출을 안 적은 날'이므로 넣지 않는다
+  const savedDays = [...new Set(data.entries.filter((e) => daily(e) && e.date < todayISO).map((e) => e.date))]
     .sort()
     .map((iso) => {
-      // 오늘 예산과 기준을 맞추기 위해 지난 날에도 현재 목표 저축액을 빼고 계산한다
-      const dayBudget = perDayFrom(Math.max(0, spendBalanceOn(iso) - saveGoal), daysToPayFrom(iso));
+      // 오늘 예산과 같은 기준 — 현재 목표를 빼고, 특별 지출은 되돌린다
+      const dayBudget = perDayFrom(
+        Math.max(0, spendBalanceOn(iso) + specialBefore(iso) - saveGoal),
+        daysToPayFrom(iso)
+      );
       const spent = spentOn(iso);
       return { iso, budget: dayBudget, spent, diff: dayBudget - spent };
     });
@@ -701,6 +721,27 @@ export default function MoneyBoard() {
     .filter((e) => e.type === "transfer" && e.savedFrom && isPast(e) && inCycle(e.date))
     .reduce((s, e) => s + e.amount, 0);
   const saved = Math.round(savedRaw) - sentSaved;
+
+  /* 소비의 의미 — 이번 사이클을 일상/특별로 나누고 그 안에서 값졌다·아까웠다·미분류 */
+  const cycleExpenses = data.entries.filter((e) => e.type === "expense" && isPast(e) && inCycle(e.date));
+  const sumOf = (list) => list.reduce((s, e) => s + e.amount, 0);
+  const bucket = (list) => ({
+    all: sumOf(list),
+    good: sumOf(list.filter((e) => e.value === "good")),
+    waste: sumOf(list.filter((e) => e.value === "waste")),
+    none: sumOf(list.filter((e) => !e.value)),
+  });
+  const cycleValue = {
+    daily: bucket(cycleExpenses.filter((e) => !e.special)),
+    special: bucket(cycleExpenses.filter((e) => e.special)),
+  };
+  const wasteList = cycleExpenses.filter((e) => e.value === "waste").sort((a, b) => b.date.localeCompare(a.date));
+  const wasteTotal = sumOf(wasteList);
+  // 되돌아보기 — 오늘 것은 빼고 아직 표시하지 않은 지난 지출만
+  const toReview = data.entries
+    .filter((e) => e.type === "expense" && !e.value && e.date < todayISO)
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, 30);
 
   /* 모이는 돈 — 올해 12월 말까지 */
   const curY = nowD.getFullYear(), curM = nowD.getMonth();
@@ -769,13 +810,28 @@ export default function MoneyBoard() {
       from: eKind === "income" ? null : fromId,
       to: eKind === "expense" ? null : toId,
       auto: false, ruleId: null,
+      value: null, special: eKind === "expense" && eSpecial,
     };
     upEntries((d) => { d.entries.unshift(entry); d.entries = d.entries.slice(0, 500); return d; });
-    setEAmt(""); setEText("");
+    setEAmt(""); setEText(""); setESpecial(false);
     setEKind("expense"); // 수입·이체 모드가 남아 다음 지출까지 잘못 잡히는 걸 막는다
   };
 
   const removeEntry = (id) => upEntries((d) => { d.entries = d.entries.filter((x) => x.id !== id); return d; });
+
+  /* 보통 → 값졌다 → 아까웠다 순환. 금액이 바뀌는 게 아니라 ts 는 건드리지 않는다 */
+  const cycleEntryValue = (id) =>
+    up((d) => {
+      const e = d.entries.find((x) => x.id === id);
+      if (e) e.value = e.value === null ? "good" : e.value === "good" ? "waste" : null;
+      return d;
+    });
+  const setEntryValue = (id, v) =>
+    up((d) => {
+      const e = d.entries.find((x) => x.id === id);
+      if (e) e.value = e.value === v ? null : v;
+      return d;
+    });
 
   const startEntryEdit = (e) =>
     setEntryEdit({
@@ -934,9 +990,17 @@ export default function MoneyBoard() {
         </div>
       </div>
     ) : (
-      <Row key={e.id} first={first} onClick={() => startEntryEdit(e)}>
+      <Row key={e.id} first={first}
+        onClick={e.type === "expense" ? () => cycleEntryValue(e.id) : undefined}>
+        {e.type === "expense" && (
+          <span className="shrink-0 w-3 text-center text-[15px]" title={e.value === "good" ? "값졌다" : e.value === "waste" ? "아까웠다" : "보통"}>
+            {e.value ? <span style={{ color: e.value === "good" ? C.accent : C.sub }}>●</span> : ""}
+          </span>
+        )}
         <span className="text-[15px] flex-1 min-w-0 truncate"
-          style={{ color: e.type === "transfer" ? C.sub : C.text }}>{e.text}</span>
+          style={{ color: e.type === "transfer" ? C.sub : C.text }}>
+          {e.special && <span style={{ color: C.sub }}>★ </span>}{e.text}
+        </span>
         {e.auto && <Tag>자동</Tag>}
         <div className="text-right shrink-0">
           <div className="text-[15px] tabular-nums"
@@ -945,6 +1009,8 @@ export default function MoneyBoard() {
           </div>
           <div className="text-[13px] truncate max-w-[150px]" style={{ color: C.sub }}>{acctLine(e)}</div>
         </div>
+        <button onClick={(ev) => { ev.stopPropagation(); startEntryEdit(e); }}
+          style={{ color: C.sub }} title="수정"><Pencil size={14} /></button>
         <button onClick={(ev) => { ev.stopPropagation(); removeEntry(e.id); }}
           style={{ color: C.sub }} title="삭제">×</button>
       </Row>
@@ -1108,6 +1174,22 @@ export default function MoneyBoard() {
               <Field type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className="text-[13px]" />
               {eKind !== "income" && <AcctSelect value={fromId} onChange={setEFrom} />}
               {eKind !== "expense" && <AcctSelect value={toId} onChange={setETo} />}
+              {eKind === "expense" && (
+                <button
+                  onClick={() => {
+                    const next = !eSpecial;
+                    setESpecial(next);
+                    // 특별 지출은 보통 세이프박스에서 나가므로 출금 계좌를 제안한다 (바꿔도 된다)
+                    if (next && saveAcc) setEFrom(saveAcc.id);
+                    else if (!next && spendAcc) setEFrom(spendAcc.id);
+                  }}
+                  className="text-[13px] px-2.5 py-1.5 rounded-[10px]"
+                  style={eSpecial
+                    ? { background: C.accent, color: "#fff" }
+                    : { background: C.fill, color: C.sub }}>
+                  ★ 특별
+                </button>
+              )}
               <button onClick={addEntry}
                 className="ml-auto text-[15px] px-4 py-2 rounded-[10px] font-medium"
                 style={{ background: C.accent, color: "#fff" }}>
@@ -1161,6 +1243,23 @@ export default function MoneyBoard() {
                 style={{ background: C.accent, color: "#fff" }}>보내기</button>
               <button onClick={() => setShowSend(false)} className="text-[15px]" style={{ color: C.sub }}>취소</button>
             </Row>
+          )}
+          {wasteTotal > 0 && (
+            <>
+              <Row onClick={() => setShowWaste(!showWaste)}>
+                <span className="text-[13px] flex-1" style={{ color: C.sub }}>
+                  이번 사이클 아까웠던 돈 <span className="tabular-nums" style={{ color: C.text }}>{fmt(wasteTotal)}</span>
+                </span>
+                <span className="text-[13px]" style={{ color: C.accent }}>{showWaste ? "접기" : "보기"}</span>
+              </Row>
+              {showWaste && wasteList.map((e) => (
+                <Row key={`w-${e.id}`}>
+                  <span className="text-[13px] shrink-0" style={{ color: C.sub }}>{md(fromISO(e.date))}</span>
+                  <span className="text-[15px] flex-1 min-w-0 truncate">{e.text}</span>
+                  <span className="text-[15px] tabular-nums">{fmt(e.amount)}</span>
+                </Row>
+              ))}
+            </>
           )}
         </Card>
 
@@ -1254,6 +1353,42 @@ export default function MoneyBoard() {
               onChange={(e) => up((d) => { d.appName = e.target.value; return d; })} />
           </Row>
         </Card>
+
+        {/* 되돌아보기 — 미분류가 있을 때만 나타난다 */}
+        {toReview.length > 0 && (
+          <Card title={`되돌아보기 · ${toReview.length}건`}>
+            {toReview.map((e, i) => (
+              <Row key={`r-${e.id}`} first={i === 0}>
+                <span className="text-[13px] shrink-0" style={{ color: C.sub }}>{md(fromISO(e.date))}</span>
+                <span className="text-[15px] flex-1 min-w-0 truncate">{e.text}</span>
+                <span className="text-[15px] tabular-nums shrink-0">{fmt(e.amount)}</span>
+                <button onClick={() => setEntryValue(e.id, "good")}
+                  className="text-[13px] px-2 py-1 rounded-[8px] shrink-0"
+                  style={{ background: C.fill, color: C.accent }}>값졌다</button>
+                <button onClick={() => setEntryValue(e.id, "waste")}
+                  className="text-[13px] px-2 py-1 rounded-[8px] shrink-0"
+                  style={{ background: C.fill, color: C.sub }}>아까웠다</button>
+              </Row>
+            ))}
+          </Card>
+        )}
+
+        {/* 사이클 요약 */}
+        {(cycleValue.daily.all > 0 || cycleValue.special.all > 0) && (
+          <Card title={`이번 사이클 · ${md(cycleStart)}–${md(cycleLast)}`}>
+            {[["일상", cycleValue.daily], ["특별", cycleValue.special]].map(([label, b], i) => (
+              <Row key={label} first={i === 0} align="items-start">
+                <span className="text-[15px] w-12 shrink-0">{label}</span>
+                <div className="flex-1 text-right">
+                  <div className="text-[15px] tabular-nums">{fmt(b.all)}</div>
+                  <div className="text-[13px] tabular-nums" style={{ color: C.sub }}>
+                    값졌다 {fmt(b.good)} · 아까웠다 {fmt(b.waste)} · 미분류 {fmt(b.none)}
+                  </div>
+                </div>
+              </Row>
+            ))}
+          </Card>
+        )}
 
         {/* 내 메뉴 */}
         <Card title="내 메뉴">
