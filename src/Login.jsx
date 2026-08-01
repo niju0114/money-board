@@ -52,6 +52,7 @@ export default function Login({ error = "" }) {
           </button>
           <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
             <input
+              id="login-email" name="email"
               type="email" value={email} onChange={(e) => setEmail(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && magic()}
               placeholder="이메일 주소" autoComplete="email"
