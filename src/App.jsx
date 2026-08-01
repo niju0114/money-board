@@ -413,6 +413,7 @@ export default function MoneyBoard() {
   const [showSend, setShowSend] = useState(false);
   const [sendAmt, setSendAmt] = useState("");
   const [showFuture, setShowFuture] = useState(false);
+  const [showSaved, setShowSaved] = useState(false);
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
   const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
@@ -637,12 +638,45 @@ export default function MoneyBoard() {
     .reduce((s, e) => s + e.amount, 0);
 
   /* 아낀 돈 — 저장하지 않고 매번 다시 구한다.
-     지난 날들의 (그날 예산 − 그날 지출) 합이라 초과한 날은 음수로 상계된다 */
-  const dailyRef = todayBudget;
-  let savedRaw = 0;
-  for (let day = startOfDay(cycleStart), g = 0; g < 45 && day < startOfDay(nowD); g++, day = addDays(day, 1)) {
-    savedRaw += dailyRef - spentOn(toISO(day));
-  }
+     그날의 예산은 오늘 값이 아니라 '그날 시작 시점' 기준으로 되돌려 계산하고,
+     지출을 하나도 안 적은 날은 아낀 날로 세지 않는다 */
+
+  // 잔액에 실제로 반영되는 기록인지 (balanceOf 와 같은 판정)
+  const countedForSpend = (e) => {
+    if (!spendAcc || e.date > todayISO) return false;
+    const baseDate = spendAcc.baseTs > 0 ? toISO(new Date(spendAcc.baseTs)) : "";
+    return !(e.ts <= spendAcc.baseTs && e.date <= baseDate);
+  };
+
+  // 그날이 시작될 때의 쓸돈 잔액 — 현재 잔액에서 그날 이후 기록을 되돌린다
+  const spendBalanceOn = (iso) => {
+    if (!spendAcc) return 0;
+    let v = spendBal;
+    for (const e of data.entries) {
+      if (!countedForSpend(e) || e.date < iso) continue;
+      if (e.to === spendAcc.id) v -= e.amount;
+      if (e.from === spendAcc.id) v += e.amount;
+    }
+    return Math.round(v);
+  };
+
+  // 그 날짜에서 급여일까지 남은 일수 (그날 포함)
+  const daysToPayFrom = (iso) => {
+    const day = fromISO(iso);
+    const next = new Date(day.getFullYear(), day.getMonth(), data.payday);
+    if (day.getDate() >= data.payday) next.setMonth(next.getMonth() + 1);
+    return Math.max(1, Math.round((next - day) / 86400000));
+  };
+
+  // 지출을 적은 지난 날들만 모은다 (오늘과 미래는 제외)
+  const savedDays = [...new Set(data.entries.filter((e) => fromSpend(e) && e.date < todayISO).map((e) => e.date))]
+    .sort()
+    .map((iso) => {
+      const dayBudget = perDayFrom(spendBalanceOn(iso), daysToPayFrom(iso));
+      const spent = spentOn(iso);
+      return { iso, budget: dayBudget, spent, diff: dayBudget - spent };
+    });
+  const savedRaw = savedDays.reduce((s, d) => s + d.diff, 0);
   // 이미 투자로 보낸 몫은 빼고 남은 것만 보여준다
   const sentSaved = data.entries
     .filter((e) => e.type === "transfer" && e.savedFrom && isPast(e) && inCycle(e.date))
@@ -736,11 +770,16 @@ export default function MoneyBoard() {
     upEntries((d) => {
       const e = d.entries.find((x) => x.id === entryEdit.id);
       if (!e) return d;
+      const type = entryEdit.type;
       e.date = entryEdit.date || e.date;
       e.amount = n;
-      e.text = entryEdit.text.trim() || kindLabel[e.type];
-      e.from = e.type === "income" ? null : entryEdit.from;
-      e.to = e.type === "expense" ? null : entryEdit.to;
+      e.type = type;
+      e.text = entryEdit.text.trim() || kindLabel[type];
+      e.from = type === "income" ? null : entryEdit.from;
+      e.to = type === "expense" ? null : entryEdit.to;
+      // 지운 뒤 다시 적은 것과 같은 결과가 나오도록 기록 시각을 지금으로 올린다.
+      // 이걸 빼면 기준 시각 이전의 기록을 고쳤을 때 잔액이 꿈쩍하지 않는다
+      e.ts = Date.now();
       return d;
     });
     setEntryEdit(null);
@@ -858,6 +897,8 @@ export default function MoneyBoard() {
             className="flex-1 min-w-[110px]" />
         </div>
         <div className="flex flex-wrap items-center gap-2 mt-2.5">
+          <Seg options={[["expense", "지출"], ["income", "수입"], ["transfer", "이체"]]}
+            value={entryEdit.type} onChange={(k) => setEntryEdit({ ...entryEdit, type: k })} />
           {entryEdit.type !== "income" && (
             <span className="flex items-center gap-1 text-[13px]" style={{ color: C.sub }}>
               출금 <AcctSelect value={entryEdit.from} onChange={(v) => setEntryEdit({ ...entryEdit, from: v })} />
@@ -1056,16 +1097,41 @@ export default function MoneyBoard() {
             </div>
           </div>
 
-          {/* 아낀 돈 */}
+          {/* 아낀 돈 — 숫자를 누르면 날짜별 근거가 펼쳐진다 */}
           <Row>
-            <span className="text-[13px] flex-1" style={{ color: C.sub }}>
-              이번 사이클 아낀 돈 <span className="tabular-nums" style={{ color: C.text }}>{fmt(saved)}</span>
-            </span>
+            <button onClick={() => setShowSaved(!showSaved)} className="text-[13px] flex-1 text-left" style={{ color: C.sub }}>
+              아낀 돈 <span className="tabular-nums" style={{ color: C.text }}>{fmt(saved)}</span>
+              {savedDays.length > 0 && ` · 기록 있는 ${savedDays.length}일 기준`}
+              <span style={{ color: C.accent }}>{showSaved ? " 접기" : " 내역"}</span>
+            </button>
             {saved > 0 && investAcc && spendAcc && !showSend && (
               <button onClick={() => { setSendAmt(String(saved)); setShowSend(true); }}
-                className="text-[13px]" style={{ color: C.accent }}>투자로 보내기</button>
+                className="text-[13px] shrink-0" style={{ color: C.accent }}>투자로 보내기</button>
             )}
           </Row>
+          {showSaved && (
+            savedDays.length === 0 ? (
+              <Row><span className="text-[13px]" style={{ color: C.sub }}>아직 지출을 적은 지난 날이 없어요.</span></Row>
+            ) : (
+              <>
+                <Row>
+                  <span className="text-[13px] flex-1" style={{ color: C.sub }}>날짜</span>
+                  <span className="text-[13px] w-20 text-right" style={{ color: C.sub }}>그날 예산</span>
+                  <span className="text-[13px] w-20 text-right" style={{ color: C.sub }}>쓴 돈</span>
+                  <span className="text-[13px] w-20 text-right" style={{ color: C.sub }}>차액</span>
+                </Row>
+                {savedDays.map((d) => (
+                  <Row key={d.iso}>
+                    <span className="text-[13px] flex-1">{dayLabel(d.iso)}</span>
+                    <span className="text-[13px] w-20 text-right tabular-nums" style={{ color: C.sub }}>{fmt(d.budget)}</span>
+                    <span className="text-[13px] w-20 text-right tabular-nums" style={{ color: C.sub }}>{fmt(d.spent)}</span>
+                    <span className="text-[13px] w-20 text-right tabular-nums"
+                      style={{ color: d.diff < 0 ? C.danger : C.text }}>{fmt(d.diff)}</span>
+                  </Row>
+                ))}
+              </>
+            )
+          )}
           {showSend && (
             <Row>
               <Field autoFocus value={sendAmt} onChange={(e) => setSendAmt(e.target.value)} inputMode="decimal"
