@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { Plus, Trash2, RotateCcw, Check, Pencil } from "lucide-react";
+import { supabase, serverEnabled } from "./supabase";
+import Login from "./Login";
+import { push, pullMerge, uploadAll, saveSnap, clearSnap, computeChanges, hasChanges, hasLocalContent } from "./sync";
 
 /* ── 디자인 토큰 (다크 모드는 index.css의 CSS 변수가 처리) ── */
 const C = {
@@ -410,9 +413,14 @@ export default function MoneyBoard() {
   const [showSend, setShowSend] = useState(false);
   const [sendAmt, setSendAmt] = useState("");
   const [showFuture, setShowFuture] = useState(false);
+  const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
+  const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
+  const [askUpload, setAskUpload] = useState(false);
+  const [updateReady, setUpdateReady] = useState(false);
+  const pushTimer = useRef(null);
+  const pulled = useRef(false);
   const [menuName, setMenuName] = useState("");
   const [menuPrice, setMenuPrice] = useState("");
-  const [updateReady, setUpdateReady] = useState(false);
   const [pMonth, setPMonth] = useState("");
   const [pAmt, setPAmt] = useState("");
   const [pMemo, setPMemo] = useState("");
@@ -428,6 +436,71 @@ export default function MoneyBoard() {
     runRules(d); // 앱을 열 때 도래한 고정 항목을 기록으로 만든다
     setData(d);
     loaded.current = true;
+  }, []);
+
+  /* 로그인 상태 추적 — 서버를 안 쓰면 아무것도 하지 않는다 */
+  useEffect(() => {
+    if (!serverEnabled) { setSession(null); return; }
+    supabase.auth.getSession().then(({ data: s }) => setSession(s.session ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
+      setSession(s ?? null);
+      if (!s) { pulled.current = false; clearSnap(); }
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  /* 로그인 직후 한 번: 서버 상태를 받아 로컬과 합친다 */
+  useEffect(() => {
+    if (!serverEnabled || !session || !data || pulled.current) return;
+    pulled.current = true;
+    (async () => {
+      setSyncState("syncing");
+      try {
+        const { merged, serverEmpty } = await pullMerge(session.user.id, data);
+        if (serverEmpty && hasLocalContent(data)) {
+          setAskUpload(true); // 이 기기 데이터를 올릴지 한 번만 묻는다
+          setSyncState("idle");
+          return;
+        }
+        saveSnap(merged); // 받아온 상태는 이미 서버와 같으므로 되올리지 않는다
+        setData(merged);
+        setSyncState("idle");
+      } catch {
+        setSyncState(navigator.onLine ? "error" : "offline");
+      }
+    })();
+  }, [session, data]);
+
+  /* 로컬이 바뀌면 잠시 뒤 서버로 — 실패하면 스냅샷이 그대로라 다음에 다시 시도된다 */
+  useEffect(() => {
+    if (!serverEnabled || !session || !data || !pulled.current || askUpload) return;
+    if (!hasChanges(computeChanges(data))) { setSyncState((s) => (s === "syncing" ? "idle" : s)); return; }
+    clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(async () => {
+      if (!navigator.onLine) { setSyncState("offline"); return; }
+      setSyncState("syncing");
+      try {
+        await push(session.user.id, data);
+        setSyncState("idle");
+      } catch {
+        setSyncState(navigator.onLine ? "error" : "offline");
+      }
+    }, 1200);
+    return () => clearTimeout(pushTimer.current);
+  }, [data, session, askUpload]);
+
+  /* 다시 온라인이 되면 밀린 변경을 밀어 올린다 */
+  useEffect(() => {
+    if (!serverEnabled) return;
+    const online = () => setSyncState((s) => (s === "offline" ? "idle" : s));
+    const offline = () => setSyncState("offline");
+    window.addEventListener("online", online);
+    window.addEventListener("offline", offline);
+    if (!navigator.onLine) setSyncState("offline");
+    return () => {
+      window.removeEventListener("online", online);
+      window.removeEventListener("offline", offline);
+    };
   }, []);
 
   useEffect(() => {
@@ -479,12 +552,14 @@ export default function MoneyBoard() {
     };
   }, [data]);
 
-  if (!data)
+  if (!data || session === undefined)
     return (
       <div className="min-h-screen flex items-center justify-center text-[15px]" style={{ color: C.sub }}>
         불러오는 중…
       </div>
     );
+
+  if (serverEnabled && !session) return <Login />;
 
   /* ── 파생값 ── */
   const up = (fn) => setData((d) => fn(structuredClone(d)));
@@ -825,7 +900,14 @@ export default function MoneyBoard() {
         <header className="flex items-start justify-between px-1">
           <div>
             <h1 className="text-[28px] font-semibold tracking-tight leading-tight">민준의 돈</h1>
-            <div className="text-[13px] mt-0.5" style={{ color: C.sub }}>쓴 날 바로 적기</div>
+            <div className="text-[13px] mt-0.5" style={{ color: C.sub }}>
+              {serverEnabled
+                ? syncState === "syncing" ? "전송 중…"
+                : syncState === "offline" ? "오프라인 — 나중에 전송"
+                : syncState === "error" ? "전송 실패 — 다시 시도해요"
+                : "동기화됨"
+                : "쓴 날 바로 적기"}
+            </div>
           </div>
           {editPay ? (
             <input
@@ -844,6 +926,40 @@ export default function MoneyBoard() {
             </button>
           )}
         </header>
+
+        {updateReady && (
+          <button onClick={() => location.reload()}
+            className="rounded-2xl px-4 py-3 text-[15px] text-left w-full font-medium"
+            style={{ background: C.accent, color: "#fff" }}>
+            업데이트 있음 — 눌러서 새로고침
+          </button>
+        )}
+
+        {askUpload && (
+          <div className="rounded-2xl px-4 py-3" style={{ background: C.card }}>
+            <div className="text-[15px]">이 기기에 있던 기록을 내 계정으로 올릴까요?</div>
+            <div className="text-[13px] mt-1" style={{ color: C.sub }}>
+              계정이 비어 있어요. 올리지 않으면 이 기기 기록은 서버에 저장되지 않습니다.
+            </div>
+            <div className="flex gap-2 mt-3">
+              <button
+                onClick={async () => {
+                  setAskUpload(false);
+                  setSyncState("syncing");
+                  try { await uploadAll(session.user.id, data); setSyncState("idle"); }
+                  catch { setSyncState(navigator.onLine ? "error" : "offline"); }
+                }}
+                className="text-[15px] px-4 py-2 rounded-[10px] font-medium"
+                style={{ background: C.accent, color: "#fff" }}>
+                올리기
+              </button>
+              <button onClick={() => { setAskUpload(false); saveSnap(data); }}
+                className="text-[15px] px-3 py-2" style={{ color: C.sub }}>
+                나중에
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* 탭 — 매일 볼 것과 가끔 손볼 것을 나눈다 */}
         <div className="flex rounded-[9px] p-[2px]" style={{ background: C.fill }}>
@@ -1329,6 +1445,16 @@ export default function MoneyBoard() {
             <button onClick={addPlanned} className="text-[15px] px-3.5 py-2 rounded-[10px]" style={{ color: C.accent }}>추가</button>
           </div>
         </Card>
+
+        {serverEnabled && session && (
+          <Card title="계정">
+            <Row first>
+              <span className="text-[15px] flex-1 min-w-0 truncate">{session.user.email ?? "로그인됨"}</span>
+              <button onClick={async () => { clearSnap(); await supabase.auth.signOut(); }}
+                className="text-[15px]" style={{ color: C.danger }}>로그아웃</button>
+            </Row>
+          </Card>
+        )}
 
         {/* 메모 */}
         <Card title="메모">

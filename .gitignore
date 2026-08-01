@@ -3,3 +3,6 @@ dist/
 dev-dist/
 *.local
 .DS_Store
+.env
+.env.*
+!.env.example
