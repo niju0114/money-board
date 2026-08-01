@@ -1496,8 +1496,12 @@ export default function MoneyBoard() {
 
         </>)}
 
-        <div className="px-4 text-[12px] tabular-nums" style={{ color: C.sub }}>
-          {__BUILD_COMMIT__} · {new Date(__BUILD_TIME__).toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" })}
+        <div className="px-4 text-[12px]" style={{ color: C.sub }}>
+          <span className="tabular-nums">
+            {__BUILD_COMMIT__} · {new Date(__BUILD_TIME__).toLocaleString("ko-KR", { dateStyle: "short", timeStyle: "short" })}
+          </span>
+          {" · "}
+          {serverEnabled ? "서버 연결" : "로컬 전용 (Supabase 키 없음)"}
         </div>
 
         <footer className="flex items-center justify-between px-4 text-[13px]" style={{ color: C.sub }}>

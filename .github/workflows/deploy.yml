@@ -26,6 +26,19 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # 시크릿이 빌드에 실제로 들어왔는지 로그로 확인 (값은 찍지 않는다)
+      - name: Check Supabase secrets
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          if [ -n "$VITE_SUPABASE_URL" ] && [ -n "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "Supabase secrets: PRESENT — 서버 모드로 빌드합니다"
+          else
+            echo "Supabase secrets: MISSING — 로컬 전용으로 빌드합니다"
+            echo "  repository secret 인지(environment secret 은 이 job 에서 안 보임), 이름이"
+            echo "  VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY 인지 확인하세요."
+          fi
       # 값이 비어 있으면 앱은 서버 없이 로컬 전용으로 빌드된다
       - run: npm run build
         env:
