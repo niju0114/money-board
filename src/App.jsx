@@ -152,7 +152,7 @@ const applyRules = (d, from) => {
   }
   if (made) {
     d.entries.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.ts - a.ts));
-    d.entries = d.entries.slice(0, 500);
+    // 오래된 기록을 잘라내면 동기화가 그걸 '삭제'로 보고 서버에서도 지운다 → 자르지 않는다
     d.lastAuto = { date: toISO(today), count: made };
   }
   d.autoRunDate = toISO(today);
@@ -420,6 +420,9 @@ export default function MoneyBoard() {
   const [goalEdit, setGoalEdit] = useState(null); // null 이면 보기 상태
   const [eSpecial, setESpecial] = useState(false);
   const [showWaste, setShowWaste] = useState(false);
+  const [auditId, setAuditId] = useState(null);
+  const [showAudit, setShowAudit] = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
   const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
@@ -507,12 +510,13 @@ export default function MoneyBoard() {
       }
     }, 1200);
     return () => clearTimeout(pushTimer.current);
-  }, [data, session, askUpload]);
+    // retryTick: 다시 온라인이 됐을 때 편집 없이도 밀린 변경을 올리기 위한 트리거
+  }, [data, session, askUpload, retryTick]);
 
   /* 다시 온라인이 되면 밀린 변경을 밀어 올린다 */
   useEffect(() => {
     if (!serverEnabled) return;
-    const online = () => setSyncState((s) => (s === "offline" ? "idle" : s));
+    const online = () => { setSyncState("idle"); setRetryTick((t) => t + 1); };
     const offline = () => setSyncState("offline");
     window.addEventListener("online", online);
     window.addEventListener("offline", offline);
@@ -599,10 +603,9 @@ export default function MoneyBoard() {
   const isPast = (e) => e.date <= todayISO;
   // 하루 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
   const fromSpend = (e) => e.type === "expense" && spendAcc && e.from === spendAcc.id;
-  // 특별 지출(여행·공연 등)은 일상 페이스를 흔들지 않도록 예산 계산에서 뺀다.
-  // 잔액에는 그대로 반영되므로 실제 돈은 정확하다
-  const daily = (e) => fromSpend(e) && !e.special;
-  const spentOn = (iso) => data.entries.filter((e) => daily(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
+  // '특별'은 분류·되돌아보기용 표시일 뿐 예산 계산에는 관여하지 않는다.
+  // 어느 계좌에서 냈는지가 곧 계산 기준이다
+  const spentOn = (iso) => data.entries.filter((e) => fromSpend(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
 
   const cycleStart = new Date(nowD.getFullYear(), nowD.getMonth() - (nowD.getDate() < data.payday ? 1 : 0), data.payday);
   const cycleEnd = new Date(cycleStart.getFullYear(), cycleStart.getMonth() + 1, data.payday);
@@ -610,14 +613,8 @@ export default function MoneyBoard() {
   cycleLast.setDate(cycleLast.getDate() - 1);
   const inCycle = (iso) => iso >= toISO(cycleStart) && iso < toISO(cycleEnd);
 
-  // 이번 사이클의 특별 지출은 분자에서 되돌려 하루 예산이 흔들리지 않게 한다
-  const specialBefore = (iso) =>
-    data.entries
-      .filter((e) => fromSpend(e) && e.special && inCycle(e.date) && e.date < iso)
-      .reduce((s, e) => s + e.amount, 0);
-  const specialToday = data.entries
-    .filter((e) => fromSpend(e) && e.special && inCycle(e.date) && e.date === todayISO)
-    .reduce((s, e) => s + e.amount, 0);
+  // 목표는 그 시점 잔액의 80%를 넘지 못하게 막는다 — 안 그러면 예산이 0으로 눌린다
+  const goalFor = (base) => Math.max(0, Math.min(data.saveGoal, Math.floor(base * 0.8)));
 
   const weekSpent = data.entries
     .filter((e) => fromSpend(e) && isPast(e) && inThisWeek(e.date))
@@ -628,11 +625,10 @@ export default function MoneyBoard() {
   const todaySpent = spentOn(todayISO);
   // 오늘 지출은 분자에서 되돌려 하루 시작 시점 값으로 고정한다 —
   // 오늘 쓸수록 오늘 예산 자체가 줄어드는 일을 막는다
-  const dayBase = spendBal + todaySpent + specialBefore(todayISO) + specialToday;
+  const dayBase = spendBal + todaySpent;
   const spreadDays = Math.max(MIN_SPREAD_DAYS, pay.days);
-  // 목표가 잔액보다 크면 쓸 돈이 없어지므로 잔액의 80%로 제한한다
-  const goalCapped = data.saveGoal > dayBase;
-  const saveGoal = goalCapped ? Math.floor(dayBase * 0.8) : data.saveGoal;
+  const saveGoal = goalFor(dayBase);
+  const goalCapped = saveGoal < data.saveGoal; // 목표가 커서 낮춰 잡았는지
   const budgetBase = Math.max(0, dayBase - saveGoal);
   const todayBudget = perDayFrom(budgetBase, pay.days);
   const todayLeft = todayBudget - todaySpent;
@@ -703,15 +699,12 @@ export default function MoneyBoard() {
   };
 
   // 지출을 적은 지난 날들만 모은다 (오늘과 미래는 제외)
-  // 특별 지출만 있는 날은 '일상 지출을 안 적은 날'이므로 넣지 않는다
-  const savedDays = [...new Set(data.entries.filter((e) => daily(e) && e.date < todayISO).map((e) => e.date))]
+  const savedDays = [...new Set(data.entries.filter((e) => fromSpend(e) && e.date < todayISO).map((e) => e.date))]
     .sort()
     .map((iso) => {
-      // 오늘 예산과 같은 기준 — 현재 목표를 빼고, 특별 지출은 되돌린다
-      const dayBudget = perDayFrom(
-        Math.max(0, spendBalanceOn(iso) + specialBefore(iso) - saveGoal),
-        daysToPayFrom(iso)
-      );
+      // 오늘 예산과 같은 기준 — 그날 잔액에서 목표(그날 잔액의 80% 상한)를 뺀다
+      const base = spendBalanceOn(iso);
+      const dayBudget = perDayFrom(Math.max(0, base - goalFor(base)), daysToPayFrom(iso));
       const spent = spentOn(iso);
       return { iso, budget: dayBudget, spent, diff: dayBudget - spent };
     });
@@ -721,6 +714,26 @@ export default function MoneyBoard() {
     .filter((e) => e.type === "transfer" && e.savedFrom && isPast(e) && inCycle(e.date))
     .reduce((s, e) => s + e.amount, 0);
   const saved = Math.round(savedRaw) - sentSaved;
+
+  /* 잔액 검산 — balanceOf 와 똑같은 판정으로, 어떤 기록이 반영됐는지 그대로 보여준다 */
+  const auditAcc = data.accounts.find((a) => a.id === auditId) ?? spendAcc ?? data.accounts[0];
+  const audit = (() => {
+    if (!auditAcc) return null;
+    const baseDate = auditAcc.baseTs > 0 ? toISO(new Date(auditAcc.baseTs)) : "";
+    const lines = [];
+    let v = auditAcc.baseAmount;
+    for (const e of [...data.entries].sort((a, b) => a.date.localeCompare(b.date) || a.ts - b.ts)) {
+      const future = e.date > todayISO;
+      const preBase = e.ts <= auditAcc.baseTs && e.date <= baseDate;
+      const hit = e.to === auditAcc.id || e.from === auditAcc.id;
+      if (!hit) continue;
+      const delta = (e.to === auditAcc.id ? e.amount : 0) - (e.from === auditAcc.id ? e.amount : 0);
+      const counted = !future && !preBase;
+      if (counted) v += delta;
+      lines.push({ e, delta, counted, why: future ? "예정" : preBase ? "기준 이전" : "" });
+    }
+    return { base: auditAcc.baseAmount, baseDate, lines, total: Math.round(v) };
+  })();
 
   /* 소비의 의미 — 이번 사이클을 일상/특별로 나누고 그 안에서 값졌다·아까웠다·미분류 */
   const cycleExpenses = data.entries.filter((e) => e.type === "expense" && isPast(e) && inCycle(e.date));
@@ -812,7 +825,7 @@ export default function MoneyBoard() {
       auto: false, ruleId: null,
       value: null, special: eKind === "expense" && eSpecial,
     };
-    upEntries((d) => { d.entries.unshift(entry); d.entries = d.entries.slice(0, 500); return d; });
+    upEntries((d) => { d.entries.unshift(entry); return d; });
     setEAmt(""); setEText(""); setESpecial(false);
     setEKind("expense"); // 수입·이체 모드가 남아 다음 지출까지 잘못 잡히는 걸 막는다
   };
@@ -896,7 +909,7 @@ export default function MoneyBoard() {
         text: "아낀 돈 → 투자", from: spendAcc.id, to: investAcc.id,
         auto: false, ruleId: null, savedFrom: true,
       });
-      d.entries = d.entries.slice(0, 500);
+      // 오래된 기록을 잘라내면 동기화가 그걸 '삭제'로 보고 서버에서도 지운다 → 자르지 않는다
       return d;
     });
     setSendAmt(""); setShowSend(false);
@@ -1352,6 +1365,55 @@ export default function MoneyBoard() {
             <Field value={data.appName} className="w-40 text-[15px] text-right"
               onChange={(e) => up((d) => { d.appName = e.target.value; return d; })} />
           </Row>
+        </Card>
+
+        {/* 잔액 검산 — 숫자가 어긋날 때 원인을 바로 볼 수 있게 */}
+        <Card title="잔액 검산">
+          <Row first onClick={() => setShowAudit(!showAudit)}>
+            <span className="text-[15px] flex-1">{auditAcc ? auditAcc.name : "계좌 없음"}</span>
+            <span className="text-[15px] tabular-nums">{audit ? fmt(audit.total) : "—"}</span>
+            <span className="text-[13px]" style={{ color: C.accent }}>{showAudit ? "접기" : "열기"}</span>
+          </Row>
+          {showAudit && audit && (
+            <>
+              <Row>
+                <span className="text-[13px] flex-1" style={{ color: C.sub }}>계좌</span>
+                <select value={auditAcc.id} onChange={(e) => setAuditId(e.target.value)}
+                  className={`${fieldCls} text-[13px]`} style={{ background: C.field }}>
+                  {data.accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </Row>
+              <Row>
+                <span className="text-[13px] flex-1" style={{ color: C.sub }}>기준 잔액 · {baseLabel(auditAcc.baseTs)}</span>
+                <span className="text-[13px] tabular-nums">{fmt(audit.base)}</span>
+              </Row>
+              {audit.lines.length === 0 && (
+                <Row><span className="text-[13px]" style={{ color: C.sub }}>이 계좌에 걸린 기록이 없어요.</span></Row>
+              )}
+              {audit.lines.map(({ e, delta, counted, why }) => (
+                <Row key={`a-${e.id}`}>
+                  <span className="text-[13px] shrink-0 w-12" style={{ color: C.sub }}>{md(fromISO(e.date))}</span>
+                  <span className="text-[13px] flex-1 min-w-0 truncate" style={{ color: counted ? C.text : C.sub }}>
+                    {e.auto && "자동 "}{e.special && "★ "}{e.text}
+                  </span>
+                  {why && <Tag>{why}</Tag>}
+                  <span className="text-[13px] tabular-nums shrink-0"
+                    style={{ color: counted ? (delta >= 0 ? C.accent : C.text) : C.sub }}>
+                    {delta >= 0 ? "+" : "−"}{fmt(Math.abs(delta))}
+                  </span>
+                </Row>
+              ))}
+              <Row>
+                <span className="text-[15px] flex-1">합계</span>
+                <span className="text-[15px] tabular-nums font-semibold">{fmt(audit.total)}</span>
+              </Row>
+              <Row>
+                <span className="text-[13px]" style={{ color: C.sub }}>
+                  반영 {audit.lines.filter((l) => l.counted).length}건 · 제외 {audit.lines.filter((l) => !l.counted).length}건
+                </span>
+              </Row>
+            </>
+          )}
         </Card>
 
         {/* 되돌아보기 — 미분류가 있을 때만 나타난다 */}

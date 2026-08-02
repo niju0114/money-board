@@ -40,7 +40,7 @@ const rowToRule = (r) => ({
 });
 
 const setToRow = (d, uid) => ({
-  user_id: uid, payday: d.payday, week_start: d.weekStart,
+  user_id: uid, payday: d.payday, week_start: d.weekStart, app_name: d.appName ?? "내 돈",
   save_goal: Math.round(d.saveGoal) || 0, goal_monthly: Math.round(d.goal?.monthly) || 0,
   auto_run_date: d.autoRunDate || null, last_auto: d.lastAuto ?? null,
   menus: d.menus ?? [], planned: d.planned ?? [], routine: d.routine ?? "",
@@ -154,6 +154,7 @@ export async function pullMerge(uid, local) {
     if (!localChanged) {
       merged.payday = srow.payday ?? merged.payday;
       merged.weekStart = srow.week_start === 1 ? 1 : 0;
+      if (typeof srow.app_name === "string" && srow.app_name.trim()) merged.appName = srow.app_name;
       merged.saveGoal = Number(srow.save_goal) || 0;
       merged.goal = { monthly: Number(srow.goal_monthly) || 0 };
       merged.autoRunDate = srow.auto_run_date ?? null;
