@@ -20,11 +20,14 @@ const C = {
 const ROLES = {
   hub: { label: "허브" },
   spend: { label: "쓸돈" },
+  pay: { label: "페이" }, // 선불·페이 — 예산에서는 쓸돈과 똑같이 본다
   save: { label: "모음" },
   invest: { label: "투자" },
   pension: { label: "연금" },
 };
-const ROLE_ORDER = ["hub", "spend", "save", "invest", "pension"];
+const ROLE_ORDER = ["hub", "spend", "pay", "save", "invest", "pension"];
+/* 하루 예산의 재원이 되는 역할 — 통장에서 페이로 옮기는 건 합계가 변하지 않는다 */
+const SPENDING_ROLES = ["spend", "pay"];
 
 const KEY = "minjun-money-v1";
 
@@ -77,6 +80,13 @@ const dayLabel = (iso) => {
   return `${md(d)} (${WD[d.getDay()]})`;
 };
 const lastDayOf = (y, m) => new Date(y, m + 1, 0).getDate();
+
+/* datetime-local 입력에 넣을 형식 (로컬 시각 기준) */
+const toLocalInput = (ts) => {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+};
 
 /* 계좌 잔액이 어느 시점부터의 기록을 반영하는지 — 기준이 없다시피 하면 '모든 기록' */
 const baseLabel = (ts) => {
@@ -423,6 +433,10 @@ export default function MoneyBoard() {
   const [auditId, setAuditId] = useState(null);
   const [showAudit, setShowAudit] = useState(false);
   const [retryTick, setRetryTick] = useState(0);
+  const [realInput, setRealInput] = useState("");
+  const [plan, setPlan] = useState([]); // 계획 탭 — 저장하지 않는 임시 목록
+  const [planName, setPlanName] = useState("");
+  const [planAmt, setPlanAmt] = useState("");
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
   const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
@@ -598,11 +612,14 @@ export default function MoneyBoard() {
   const bal = (a) => balanceOf(data, a);
   const acct = (id) => data.accounts.find((a) => a.id === id);
   const acctName = (id) => acct(id)?.name ?? "—";
-  const spendAcc = data.accounts.find((a) => a.role === "spend");
+  // 쓸돈·페이 계좌를 한 덩어리로 본다. 통장에서 페이로 옮겨도 합계는 그대로다
+  const spendAccs = data.accounts.filter((a) => SPENDING_ROLES.includes(a.role));
+  const spendIds = new Set(spendAccs.map((a) => a.id));
+  const spendAcc = spendAccs.find((a) => a.role === "spend") ?? spendAccs[0]; // 대표 계좌
   // 아직 오지 않은 날짜의 기록은 현재 집계에 넣지 않는다 (예정 기록)
   const isPast = (e) => e.date <= todayISO;
-  // 하루 예산에서 빠지는 건 '쓸돈' 역할 계좌에서 나간 지출뿐
-  const fromSpend = (e) => e.type === "expense" && spendAcc && e.from === spendAcc.id;
+  // 하루 예산에서 빠지는 건 쓸돈·페이 계좌에서 나간 지출뿐
+  const fromSpend = (e) => e.type === "expense" && spendIds.has(e.from);
   // '특별'은 분류·되돌아보기용 표시일 뿐 예산 계산에는 관여하지 않는다.
   // 어느 계좌에서 냈는지가 곧 계산 기준이다
   const spentOn = (iso) => data.entries.filter((e) => fromSpend(e) && e.date === iso).reduce((s, e) => s + e.amount, 0);
@@ -621,7 +638,7 @@ export default function MoneyBoard() {
     .reduce((s, e) => s + e.amount, 0);
 
   const pay = paydayInfo(data.payday); // 오늘 포함, 다음 급여일까지 남은 일수
-  const spendBal = spendAcc ? bal(spendAcc) : 0;
+  const spendBal = spendAccs.reduce((s, a) => s + bal(a), 0);
   const todaySpent = spentOn(todayISO);
   // 오늘 지출은 분자에서 되돌려 하루 시작 시점 값으로 고정한다 —
   // 오늘 쓸수록 오늘 예산 자체가 줄어드는 일을 막는다
@@ -636,6 +653,8 @@ export default function MoneyBoard() {
   // 지금 멈추면 내일 예산 — 오늘 끝 잔액을 하루 줄어든 날수로 나눈다
   const tomorrowBudget = perDayFrom(Math.max(0, spendBal - saveGoal), pay.days - 1);
   const weekEstimate = todayBudget * 7;
+  // 기준 잔액을 한 번도 안 넣으면 잔액이 음수가 되고 하루 예산이 0으로 눌린다
+  const needsBalance = spendAccs.length === 0 || (spendBal <= 0 && data.entries.length > 0);
 
   /* 목표를 입력하는 중에 하루 예산이 얼마가 되는지 미리 보여준다 */
   const goalPreview = (() => {
@@ -671,21 +690,23 @@ export default function MoneyBoard() {
      그날의 예산은 오늘 값이 아니라 '그날 시작 시점' 기준으로 되돌려 계산하고,
      지출을 하나도 안 적은 날은 아낀 날로 세지 않는다 */
 
-  // 잔액에 실제로 반영되는 기록인지 (balanceOf 와 같은 판정)
-  const countedForSpend = (e) => {
-    if (!spendAcc || e.date > todayISO) return false;
-    const baseDate = spendAcc.baseTs > 0 ? toISO(new Date(spendAcc.baseTs)) : "";
-    return !(e.ts <= spendAcc.baseTs && e.date <= baseDate);
+  // 그 계좌 잔액에 실제로 반영되는 기록인지 (balanceOf 와 같은 판정)
+  const countedFor = (a, e) => {
+    if (e.date > todayISO) return false;
+    const baseDate = a.baseTs > 0 ? toISO(new Date(a.baseTs)) : "";
+    return !(e.ts <= a.baseTs && e.date <= baseDate);
   };
 
-  // 그날이 시작될 때의 쓸돈 잔액 — 현재 잔액에서 그날 이후 기록을 되돌린다
+  // 그날이 시작될 때의 쓸돈+페이 합계 — 현재 잔액에서 그날 이후 기록을 되돌린다
   const spendBalanceOn = (iso) => {
-    if (!spendAcc) return 0;
+    if (spendAccs.length === 0) return 0;
     let v = spendBal;
-    for (const e of data.entries) {
-      if (!countedForSpend(e) || e.date < iso) continue;
-      if (e.to === spendAcc.id) v -= e.amount;
-      if (e.from === spendAcc.id) v += e.amount;
+    for (const a of spendAccs) {
+      for (const e of data.entries) {
+        if (!countedFor(a, e) || e.date < iso) continue;
+        if (e.to === a.id) v -= e.amount;
+        if (e.from === a.id) v += e.amount;
+      }
     }
     return Math.round(v);
   };
@@ -715,6 +736,35 @@ export default function MoneyBoard() {
     .reduce((s, e) => s + e.amount, 0);
   const saved = Math.round(savedRaw) - sentSaved;
 
+  /* 계획 — 저장하지 않고 지금 예산에 얹어보기만 한다 */
+  const planTotal = plan.reduce((s, p) => s + p.amount, 0);
+  const planLeft = todayLeft - planTotal;
+  const planTomorrow = perDayFrom(Math.max(0, spendBal - planTotal - saveGoal), pay.days - 1);
+
+  const addPlan = () => {
+    const n = parseWon(planAmt);
+    if (!n || n <= 0) return;
+    setPlan((xs) => [...xs, { id: uid(), name: planName.trim() || "지출", amount: n }]);
+    setPlanName(""); setPlanAmt("");
+  };
+
+  const movePlanToEntries = () => {
+    if (plan.length === 0) return;
+    const from = spendAcc?.id ?? data.accounts[0]?.id ?? null;
+    const ts = Date.now();
+    upEntries((d) => {
+      plan.forEach((p, i) => {
+        d.entries.unshift({
+          id: uid(), ts: ts + i, date: todayISO, type: "expense", amount: p.amount,
+          text: p.name, from, to: null, auto: false, ruleId: null, value: null, special: false,
+        });
+      });
+      return d;
+    });
+    setPlan([]);
+    setTab("daily");
+  };
+
   /* 잔액 검산 — balanceOf 와 똑같은 판정으로, 어떤 기록이 반영됐는지 그대로 보여준다 */
   const auditAcc = data.accounts.find((a) => a.id === auditId) ?? spendAcc ?? data.accounts[0];
   const audit = (() => {
@@ -734,6 +784,20 @@ export default function MoneyBoard() {
     }
     return { base: auditAcc.baseAmount, baseDate, lines, total: Math.round(v) };
   })();
+  const realBal = parseWon(realInput);
+  const auditDiff = audit && realBal != null ? realBal - audit.total : null;
+
+  /* 실제 통장 잔액을 기준으로 다시 잡는다 — 이후 기록부터 새로 세기 시작 */
+  const resetBase = () => {
+    if (!auditAcc || realBal == null) return;
+    up((d) => {
+      const t = d.accounts.find((x) => x.id === auditAcc.id);
+      t.baseAmount = realBal;
+      t.baseTs = Date.now();
+      return d;
+    });
+    setRealInput("");
+  };
 
   /* 소비의 의미 — 이번 사이클을 일상/특별로 나누고 그 안에서 값졌다·아까웠다·미분류 */
   const cycleExpenses = data.entries.filter((e) => e.type === "expense" && isPast(e) && inCycle(e.date));
@@ -1115,7 +1179,7 @@ export default function MoneyBoard() {
 
         {/* 탭 — 매일 볼 것과 가끔 손볼 것을 나눈다 */}
         <div className="flex rounded-[9px] p-[2px]" style={{ background: C.fill }}>
-          {[["daily", "매일"], ["manage", "관리"]].map(([k, label]) => (
+          {[["daily", "매일"], ["plan", "계획"], ["manage", "관리"]].map(([k, label]) => (
             <button key={k} onClick={() => setTab(k)}
               className="flex-1 py-1.5 rounded-[7px] text-[14px]"
               style={tab === k ? { background: C.card, color: C.text, fontWeight: 500 } : { color: C.sub }}>
@@ -1125,6 +1189,19 @@ export default function MoneyBoard() {
         </div>
 
         {tab === "daily" && (<>
+
+        {/* 쓸돈 기준 잔액이 없으면 모든 계산이 어긋난다 — 가장 먼저 알린다 */}
+        {needsBalance && (
+          <button onClick={() => { setTab("manage"); setShowAudit(true); }}
+            className="rounded-2xl px-4 py-3 text-left w-full" style={{ background: C.card }}>
+            <div className="text-[15px]">쓸돈 계좌 잔액을 한 번 맞춰주세요</div>
+            <div className="text-[13px] mt-1" style={{ color: C.sub }}>
+              {spendAcc
+                ? `지금 ${fmt(spendBal)}으로 계산돼요. 실제 잔액을 넣으면 하루 예산이 잡혀요.`
+                : "'쓸돈' 역할 계좌가 없어요. 계좌에서 지정해 주세요."}
+            </div>
+          </button>
+        )}
 
         {/* 오늘 */}
         <Card title="오늘">
@@ -1278,6 +1355,56 @@ export default function MoneyBoard() {
 
         </>)}
 
+        {tab === "plan" && (<>
+
+        {/* 계획 — 저장하지 않는 즉석 계산 */}
+        <Card title="계획">
+          <div className="pt-3 pb-1">
+            <div className="text-[13px]" style={{ color: C.sub }}>이만큼 쓰면 오늘 남는 돈</div>
+            <div className="text-[40px] leading-none font-semibold tabular-nums tracking-tight mt-1"
+              style={{ color: planLeft < 0 ? C.danger : C.text }}>
+              {fmt(planLeft)}
+            </div>
+            <div className="text-[13px] mt-2" style={{ color: C.sub }}>
+              지금 {fmt(todayLeft)} · 계획 {fmt(planTotal)}
+            </div>
+            <div className="text-[13px]" style={{ color: C.sub }}>
+              내일 예산 {fmt(tomorrowBudget)} → <span style={{ color: C.text }}>{fmt(planTomorrow)}</span>
+            </div>
+          </div>
+
+          <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
+            <div className="flex flex-wrap items-center gap-2">
+              <Field value={planName} onChange={(e) => setPlanName(e.target.value)} placeholder="항목"
+                onKeyDown={(e) => e.key === "Enter" && addPlan()} className="flex-1 min-w-[100px]" />
+              <Field value={planAmt} onChange={(e) => setPlanAmt(e.target.value)} placeholder="금액" inputMode="decimal"
+                onKeyDown={(e) => e.key === "Enter" && addPlan()} className="w-24 tabular-nums" />
+              <button onClick={addPlan} className="text-[15px] px-4 py-2 rounded-[10px] font-medium"
+                style={{ background: C.accent, color: "#fff" }}>담기</button>
+            </div>
+          </div>
+
+          {plan.length === 0 ? (
+            <Row><span className="text-[15px]" style={{ color: C.sub }}>담아둔 계획이 없어요. 새로고침하면 사라집니다.</span></Row>
+          ) : (
+            <>
+              {plan.map((p, i) => (
+                <Row key={p.id} first={i === 0}>
+                  <span className="text-[15px] flex-1 min-w-0 truncate">{p.name}</span>
+                  <span className="text-[15px] tabular-nums">{fmt(p.amount)}</span>
+                  <button onClick={() => setPlan((xs) => xs.filter((x) => x.id !== p.id))}
+                    style={{ color: C.sub }} title="빼기">×</button>
+                </Row>
+              ))}
+              <Row onClick={movePlanToEntries}>
+                <span className="text-[15px]" style={{ color: C.accent }}>이대로 지출로 옮기기</span>
+              </Row>
+            </>
+          )}
+        </Card>
+
+        </>)}
+
         {tab === "manage" && (<>
 
         {/* 예산 */}
@@ -1404,7 +1531,7 @@ export default function MoneyBoard() {
                 </Row>
               ))}
               <Row>
-                <span className="text-[15px] flex-1">합계</span>
+                <span className="text-[15px] flex-1">앱 계산값</span>
                 <span className="text-[15px] tabular-nums font-semibold">{fmt(audit.total)}</span>
               </Row>
               <Row>
@@ -1412,6 +1539,25 @@ export default function MoneyBoard() {
                   반영 {audit.lines.filter((l) => l.counted).length}건 · 제외 {audit.lines.filter((l) => !l.counted).length}건
                 </span>
               </Row>
+              <Row>
+                <span className="text-[13px] shrink-0" style={{ color: C.sub }}>실제 잔액</span>
+                <Field value={realInput} onChange={(e) => setRealInput(e.target.value)} placeholder="통장에 찍힌 금액"
+                  inputMode="decimal" className="flex-1 tabular-nums text-right" />
+              </Row>
+              {auditDiff !== null && (
+                <Row>
+                  <span className="text-[15px] flex-1">차액</span>
+                  <span className="text-[15px] tabular-nums"
+                    style={{ color: auditDiff === 0 ? C.accent : C.danger }}>
+                    {auditDiff > 0 ? "+" : ""}{fmt(auditDiff)}
+                  </span>
+                </Row>
+              )}
+              {realBal != null && (
+                <Row onClick={resetBase}>
+                  <span className="text-[15px]" style={{ color: C.accent }}>이 값으로 기준 재설정</span>
+                </Row>
+              )}
             </>
           )}
         </Card>
@@ -1508,8 +1654,25 @@ export default function MoneyBoard() {
               </button>
               <div className="flex-1 min-w-0">
                 {editAcc ? (
-                  <Field value={a.name} className="w-full text-[15px]"
-                    onChange={(e) => up((d) => { d.accounts.find((x) => x.id === a.id).name = e.target.value; return d; })} />
+                  <>
+                    <Field value={a.name} className="w-full text-[15px]"
+                      onChange={(e) => up((d) => { d.accounts.find((x) => x.id === a.id).name = e.target.value; return d; })} />
+                    {/* 기준 잔액과 기준 시각을 그대로 보여준다 — 잔액을 고치면 기준이 바뀐다는 걸 알 수 있게 */}
+                    <div className="flex items-center gap-1 mt-1.5 text-[13px]" style={{ color: C.sub }}>
+                      기준
+                      <Amount value={a.baseAmount} className="text-[13px]"
+                        onCommit={(n) => up((d) => { d.accounts.find((x) => x.id === a.id).baseAmount = n; return d; })} />
+                    </div>
+                    <Field
+                      type="datetime-local"
+                      value={a.baseTs > 0 ? toLocalInput(a.baseTs) : ""}
+                      onChange={(e) => up((d) => {
+                        const t = e.target.value ? Date.parse(e.target.value) : 0;
+                        d.accounts.find((x) => x.id === a.id).baseTs = Number.isFinite(t) ? t : 0;
+                        return d;
+                      })}
+                      className="w-full text-[13px] mt-1" />
+                  </>
                 ) : (
                   <>
                     <div className="text-[15px] truncate">{a.name}</div>
