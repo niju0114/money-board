@@ -1537,9 +1537,12 @@ export default function MoneyBoard() {
               {audit.lines.map(({ e, delta, counted, why }) => (
                 <Row key={`a-${e.id}`}>
                   <span className="text-[13px] shrink-0 w-12" style={{ color: C.sub }}>{md(fromISO(e.date))}</span>
-                  <span className="text-[13px] flex-1 min-w-0 truncate" style={{ color: counted ? C.text : C.sub }}>
-                    {e.auto && "자동 "}{e.special && "★ "}{e.text}
-                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] truncate" style={{ color: counted ? C.text : C.sub }}>
+                      {e.auto && "자동 "}{e.special && "★ "}{e.text}
+                    </div>
+                    <div className="text-[13px] truncate" style={{ color: C.sub }}>{acctLine(e)}</div>
+                  </div>
                   {why && <Tag>{why}</Tag>}
                   <span className="text-[13px] tabular-nums shrink-0"
                     style={{ color: counted ? (delta >= 0 ? C.accent : C.text) : C.sub }}>
