@@ -90,10 +90,11 @@ const toLocalInput = (ts) => {
 
 /* 계좌 잔액이 어느 시점부터의 기록을 반영하는지 — 기준이 없다시피 하면 '모든 기록' */
 const baseLabel = (ts) => {
-  if (!Number.isFinite(ts) || ts < Date.parse("2020-01-01")) return "모든 기록 반영 중";
+  if (!Number.isFinite(ts) || ts < Date.parse("2020-01-01")) return "전체 기록 기준";
   const d = new Date(ts);
-  const sameYear = d.getFullYear() === new Date().getFullYear();
-  return `${sameYear ? md(d) : `${d.getFullYear()}. ${md(d)}`} 이후 기록 반영 중`;
+  const p = (n) => String(n).padStart(2, "0");
+  const day = d.getFullYear() === new Date().getFullYear() ? md(d) : `${d.getFullYear()}. ${md(d)}`;
+  return `${day} ${p(d.getHours())}:${p(d.getMinutes())} 기준`;
 };
 
 function paydayInfo(payday) {
@@ -730,6 +731,16 @@ export default function MoneyBoard() {
       return { iso, budget: dayBudget, spent, diff: dayBudget - spent };
     });
   const savedRaw = savedDays.reduce((s, d) => s + d.diff, 0);
+  // 첫 기록일부터 어제까지 중 지출을 안 적은 날 — 세지 않았다는 걸 밝혀야 숫자를 읽을 수 있다
+  const blankDays = (() => {
+    if (savedDays.length === 0) return 0;
+    const have = new Set(savedDays.map((d) => d.iso));
+    let n = 0;
+    for (let day = fromISO(savedDays[0].iso), g = 0; g < 120 && toISO(day) < todayISO; g++, day = addDays(day, 1)) {
+      if (!have.has(toISO(day))) n++;
+    }
+    return n;
+  })();
   // 이미 투자로 보낸 몫은 빼고 남은 것만 보여준다
   const sentSaved = data.entries
     .filter((e) => e.type === "transfer" && e.savedFrom && isPast(e) && inCycle(e.date))
@@ -1291,8 +1302,10 @@ export default function MoneyBoard() {
           {/* 아낀 돈 — 숫자를 누르면 날짜별 근거가 펼쳐진다 */}
           <Row>
             <button onClick={() => setShowSaved(!showSaved)} className="text-[13px] flex-1 text-left" style={{ color: C.sub }}>
-              아낀 돈 <span className="tabular-nums" style={{ color: C.text }}>{fmt(saved)}</span>
-              {savedDays.length > 0 && ` · 기록 있는 ${savedDays.length}일 기준`}
+              예산보다 <span className="tabular-nums" style={{ color: C.text }}>{fmt(Math.abs(saved))}</span>
+              {saved >= 0 ? " 덜 썼어요" : " 더 썼어요"}
+              {savedDays.length > 0 && ` · 적은 ${savedDays.length}일`}
+              {blankDays > 0 && ` · 안 적은 ${blankDays}일 제외`}
               <span style={{ color: C.accent }}>{showSaved ? " 접기" : " 내역"}</span>
             </button>
             {saved > 0 && investAcc && spendAcc && !showSend && (
@@ -1320,7 +1333,11 @@ export default function MoneyBoard() {
                       style={{ color: d.diff < 0 ? C.danger : C.text }}>{fmt(d.diff)}</span>
                   </Row>
                 ))}
-                <Row><span className="text-[13px]" style={{ color: C.sub }}>현재 목표 기준</span></Row>
+                <Row>
+                  <span className="text-[13px]" style={{ color: C.sub }}>
+                    현재 목표 기준 · 지출을 안 적은 날은 세지 않아요
+                  </span>
+                </Row>
               </>
             )
           )}
