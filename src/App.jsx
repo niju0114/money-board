@@ -418,9 +418,11 @@ export default function MoneyBoard() {
   const [eAmt, setEAmt] = useState("");
   const [eText, setEText] = useState("");
   const [eDate, setEDate] = useState(toISO(new Date()));
-  const [eKind, setEKind] = useState("expense"); // expense | income | transfer
+  const [eKind, setEKind] = useState("expense"); // expense | income | transfer | pay
   const [eFrom, setEFrom] = useState("");
   const [eTo, setETo] = useState("");
+  const [eDraw, setEDraw] = useState(""); // 페이 결제와 함께 통장에서 빠져나간 금액
+  const [newPay, setNewPay] = useState(null); // 페이 계좌를 만드는 중 { name, amount }
   const [entryEdit, setEntryEdit] = useState(null);
   const [ruleEdit, setRuleEdit] = useState(null);
   const [showSend, setShowSend] = useState(false);
@@ -617,6 +619,11 @@ export default function MoneyBoard() {
   const spendAccs = data.accounts.filter((a) => SPENDING_ROLES.includes(a.role));
   const spendIds = new Set(spendAccs.map((a) => a.id));
   const spendAcc = spendAccs.find((a) => a.role === "spend") ?? spendAccs[0]; // 대표 계좌
+  const saveAcc = data.accounts.find((a) => a.role === "save");
+  /* 페이·선불 계좌 — 통장에서 목돈으로 충전하고 거기서 잘게 결제한다 */
+  const payAccs = data.accounts.filter((a) => a.role === "pay");
+  const payIds = new Set(payAccs.map((a) => a.id));
+  const payAcc = payAccs[0] ?? null;
   // 아직 오지 않은 날짜의 기록은 현재 집계에 넣지 않는다 (예정 기록)
   const isPast = (e) => e.date <= todayISO;
   // 하루 예산에서 빠지는 건 쓸돈·페이 계좌에서 나간 지출뿐
@@ -685,6 +692,16 @@ export default function MoneyBoard() {
     .reduce((s, e) => s + e.amount, 0);
   const cycleAll = data.entries
     .filter((e) => e.type === "expense" && isPast(e) && inCycle(e.date))
+    .reduce((s, e) => s + e.amount, 0);
+
+  /* 페이 요약 — 실제로 쓴 돈(결제)과 통장에서 빠진 돈(충전)은 다르다.
+     그 차이가 그대로 페이 잔액으로 남는다 */
+  const payBal = payAccs.reduce((s, a) => s + bal(a), 0);
+  const payCycleSpent = data.entries
+    .filter((e) => e.type === "expense" && payIds.has(e.from) && isPast(e) && inCycle(e.date))
+    .reduce((s, e) => s + e.amount, 0);
+  const payCycleDraw = data.entries
+    .filter((e) => e.type === "transfer" && payIds.has(e.to) && !payIds.has(e.from) && isPast(e) && inCycle(e.date))
     .reduce((s, e) => s + e.amount, 0);
 
   /* 아낀 돈 — 저장하지 않고 매번 다시 구한다.
@@ -887,22 +904,71 @@ export default function MoneyBoard() {
   const toId = eTo || fallbackId;
   const kindLabel = { expense: "지출", income: "수입", transfer: "이체" };
 
+  /* 페이 결제에 쓰는 두 계좌 — 결제한 페이 계좌와 돈이 빠져나간 통장 */
+  const payFromId = (payIds.has(eFrom) ? eFrom : null) ?? payAcc?.id ?? null;
+  const drawFromId =
+    (eTo && !payIds.has(eTo) && acct(eTo) ? eTo : null) ??
+    (spendAcc && !payIds.has(spendAcc.id) ? spendAcc.id : null) ??
+    data.accounts.find((a) => !payIds.has(a.id))?.id ??
+    null;
+  const drawAmt = parseWon(eDraw) ?? 0;
+
+  const mkEntry = (o) => ({
+    id: uid(), auto: false, ruleId: null, value: null, special: false, ...o,
+  });
+
+  /* 페이 결제는 기록이 둘이다 — 페이에서 나간 결제와, 통장에서 페이로 옮겨간 충전.
+     충전은 이체라서 합계를 바꾸지 않고, 예산은 결제 금액만큼만 줄어든다 */
+  const addPayEntry = () => {
+    const n = parseWon(eAmt);
+    if (!n || n <= 0 || !payFromId) return;
+    const date = eDate || todayISO;
+    const now = Date.now();
+    const made = [
+      mkEntry({
+        ts: now + 1, date, type: "expense", amount: n,
+        text: eText.trim() || "페이 결제", from: payFromId, to: null, special: eSpecial,
+      }),
+    ];
+    if (drawAmt > 0 && drawFromId) {
+      // 충전이 결제보다 먼저 일어난 것으로 둔다 — 검산에서 순서대로 읽히도록
+      made.push(mkEntry({
+        ts: now, date, type: "transfer", amount: drawAmt,
+        text: `${acct(payFromId)?.name ?? "페이"} 충전`, from: drawFromId, to: payFromId,
+      }));
+    }
+    upEntries((d) => { d.entries.unshift(...made); return d; });
+    setEAmt(""); setEText(""); setEDraw(""); setESpecial(false);
+    setEKind("expense"); // 페이 모드가 남아 다음 지출이 페이에서 빠지는 걸 막는다
+  };
+
   const addEntry = () => {
+    if (eKind === "pay") return addPayEntry();
     const n = parseWon(eAmt);
     if (!n || n <= 0) return;
-    const entry = {
-      id: uid(), ts: Date.now(), date: eDate || todayISO,
+    const entry = mkEntry({
+      ts: Date.now(), date: eDate || todayISO,
       type: eKind,
       amount: n,
       text: eText.trim() || kindLabel[eKind],
       from: eKind === "income" ? null : fromId,
       to: eKind === "expense" ? null : toId,
-      auto: false, ruleId: null,
-      value: null, special: eKind === "expense" && eSpecial,
-    };
+      special: eKind === "expense" && eSpecial,
+    });
     upEntries((d) => { d.entries.unshift(entry); return d; });
     setEAmt(""); setEText(""); setESpecial(false);
     setEKind("expense"); // 수입·이체 모드가 남아 다음 지출까지 잘못 잡히는 걸 막는다
+  };
+
+  /* 페이 계좌 만들기 — 이름과 지금 잔액만 받고 역할은 'pay' 로 고정한다 */
+  const addPayAcct = () => {
+    const name = (newPay?.name ?? "").trim() || "페이";
+    const amount = Math.max(0, parseWon(newPay?.amount) ?? 0);
+    up((d) => {
+      d.accounts.push({ id: uid(), name, note: "", baseAmount: amount, baseTs: Date.now(), role: "pay" });
+      return d;
+    });
+    setNewPay(null);
   };
 
   const removeEntry = (id) => upEntries((d) => { d.entries = d.entries.filter((x) => x.id !== id); return d; });
@@ -1104,10 +1170,12 @@ export default function MoneyBoard() {
       </Row>
     );
 
-  const AcctSelect = ({ value, onChange }) => (
+  const AcctSelect = ({ value, onChange, only }) => (
     <select value={value ?? ""} onChange={(e) => onChange(e.target.value)}
       className={`${fieldCls} text-[13px]`} style={{ background: C.field }}>
-      {data.accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+      {(only ? data.accounts.filter(only) : data.accounts).map((a) => (
+        <option key={a.id} value={a.id}>{a.name}</option>
+      ))}
     </select>
   );
 
@@ -1266,20 +1334,44 @@ export default function MoneyBoard() {
           {/* 입력 — 한 줄 */}
           <div className="py-3" style={{ borderTop: `1px solid ${C.line}` }}>
             <div className="flex flex-wrap items-center gap-2">
-              <Seg options={[["expense", "지출"], ["income", "수입"], ["transfer", "이체"]]} value={eKind} onChange={setEKind} />
-              <Field value={eAmt} onChange={(e) => setEAmt(e.target.value)} placeholder="금액" inputMode="decimal"
+              <Seg
+                options={[["expense", "지출"], ["income", "수입"], ["transfer", "이체"],
+                  ...(payAccs.length > 0 ? [["pay", "페이"]] : [])]}
+                value={eKind}
+                onChange={(k) => { setEKind(k); setEFrom(""); setETo(""); }} />
+              <Field value={eAmt} onChange={(e) => setEAmt(e.target.value)}
+                placeholder={eKind === "pay" ? "결제 금액" : "금액"} inputMode="decimal"
                 onKeyDown={(e) => e.key === "Enter" && addEntry()} className="w-24 tabular-nums" />
+              {eKind === "pay" && (
+                <Field value={eDraw} onChange={(e) => setEDraw(e.target.value)}
+                  placeholder="통장에서 빠진 금액" inputMode="decimal"
+                  onKeyDown={(e) => e.key === "Enter" && addEntry()} className="w-36 tabular-nums" />
+              )}
               <Field value={eText} onChange={(e) => setEText(e.target.value)}
-                placeholder={eKind === "income" ? "월급" : eKind === "transfer" ? "이체" : "점심"}
+                placeholder={eKind === "income" ? "월급" : eKind === "transfer" ? "이체" : eKind === "pay" ? "편의점" : "점심"}
                 onKeyDown={(e) => e.key === "Enter" && addEntry()} className="flex-1 min-w-[80px]" />
               <Field type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className="text-[13px]" />
-              {eKind !== "income" && <AcctSelect value={fromId} onChange={setEFrom} />}
-              {eKind !== "expense" && <AcctSelect value={toId} onChange={setETo} />}
-              {eKind === "expense" && (
+              {eKind === "pay" ? (
+                <>
+                  {payAccs.length > 1 && (
+                    <AcctSelect value={payFromId} onChange={setEFrom} only={(a) => payIds.has(a.id)} />
+                  )}
+                  {drawAmt > 0 && (
+                    <AcctSelect value={drawFromId} onChange={setETo} only={(a) => !payIds.has(a.id)} />
+                  )}
+                </>
+              ) : (
+                <>
+                  {eKind !== "income" && <AcctSelect value={fromId} onChange={setEFrom} />}
+                  {eKind !== "expense" && <AcctSelect value={toId} onChange={setETo} />}
+                </>
+              )}
+              {(eKind === "expense" || eKind === "pay") && (
                 <button
                   onClick={() => {
                     const next = !eSpecial;
                     setESpecial(next);
+                    if (eKind !== "expense") return;
                     // 특별 지출은 보통 세이프박스에서 나가므로 출금 계좌를 제안한다 (바꿔도 된다)
                     if (next && saveAcc) setEFrom(saveAcc.id);
                     else if (!next && spendAcc) setEFrom(spendAcc.id);
@@ -1297,6 +1389,13 @@ export default function MoneyBoard() {
                 적기
               </button>
             </div>
+            {eKind === "pay" && (
+              <div className="text-[13px] mt-2" style={{ color: C.sub }}>
+                결제는 {acct(payFromId)?.name ?? "페이"}에서 빼고, 통장에서 빠진 금액은{" "}
+                {acct(drawFromId)?.name ?? "통장"} → {acct(payFromId)?.name ?? "페이"} 이체로 함께 적어요.
+                충전은 예산을 줄이지 않아요
+              </div>
+            )}
           </div>
 
           {/* 아낀 돈 — 숫자를 누르면 날짜별 근거가 펼쳐진다 */}
@@ -1716,6 +1815,36 @@ export default function MoneyBoard() {
           {editAcc && (
             <Row onClick={() => up((d) => { d.accounts.push({ id: uid(), name: "새 계좌", note: "", baseAmount: 0, baseTs: Date.now(), role: "hub" }); return d; })}>
               <span className="text-[15px] flex items-center gap-1.5" style={{ color: C.accent }}><Plus size={15} /> 계좌 추가</span>
+            </Row>
+          )}
+          {/* 페이는 만드는 김에 잔액까지 받아 한 번에 끝낸다 — 역할을 찾아 돌릴 일이 없게 */}
+          {(editAcc || payAccs.length === 0) && (newPay ? (
+            <Row align="items-start">
+              <div className="flex-1 flex flex-wrap items-center gap-2">
+                <Field autoFocus value={newPay.name} onChange={(e) => setNewPay({ ...newPay, name: e.target.value })}
+                  placeholder="네이버페이" className="flex-1 min-w-[110px]"
+                  onKeyDown={(e) => e.key === "Enter" && addPayAcct()} />
+                <Field value={newPay.amount} onChange={(e) => setNewPay({ ...newPay, amount: e.target.value })}
+                  placeholder="지금 잔액" inputMode="decimal" className="w-28 tabular-nums"
+                  onKeyDown={(e) => e.key === "Enter" && addPayAcct()} />
+                <button onClick={addPayAcct} className="text-[15px] px-3.5 py-2 rounded-[10px] font-medium"
+                  style={{ background: C.accent, color: "#fff" }}>만들기</button>
+                <button onClick={() => setNewPay(null)} className="text-[13px] px-2" style={{ color: C.sub }}>취소</button>
+              </div>
+            </Row>
+          ) : (
+            <Row onClick={() => setNewPay({ name: "", amount: "" })}>
+              <span className="text-[15px] flex items-center gap-1.5" style={{ color: C.accent }}><Plus size={15} /> 페이 추가</span>
+              <span className="text-[13px] ml-auto" style={{ color: C.sub }}>네이버페이 같은 선불 잔액</span>
+            </Row>
+          ))}
+          {payAccs.length > 0 && (
+            <Row>
+              <span className="text-[13px] leading-relaxed" style={{ color: C.sub }}>
+                페이 잔액 <span className="tabular-nums" style={{ color: C.text }}>{fmt(payBal)}</span>
+                {" · 이번 사이클 결제 "}<span className="tabular-nums" style={{ color: C.text }}>{fmt(payCycleSpent)}</span>
+                {" · 통장 인출 "}<span className="tabular-nums" style={{ color: C.text }}>{fmt(payCycleDraw)}</span>
+              </span>
             </Row>
           )}
           <Row>
