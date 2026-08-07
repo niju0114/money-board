@@ -62,6 +62,8 @@ const parseWon = (s) => {
   return Number.isFinite(n) ? Math.round(n) : null;
 };
 const fmt = (n) => (n == null ? "" : Math.round(n).toLocaleString("ko-KR"));
+/* 달력 칸은 40px 남짓이라 백만이 넘으면 그대로는 넘친다 — 그때만 만 단위로 줄인다 */
+const fmtCell = (n) => (n >= 1000000 ? `${fmt(Math.round(n / 10000))}만` : fmt(n));
 const WD = ["일", "월", "화", "수", "목", "금", "토"];
 const toISO = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -440,6 +442,8 @@ export default function MoneyBoard() {
   const [showSend, setShowSend] = useState(false);
   const [sendAmt, setSendAmt] = useState("");
   const [showFuture, setShowFuture] = useState(false);
+  const [calShift, setCalShift] = useState(0); // 달력에서 이번 달로부터 몇 달 옮겨 봤는지
+  const [selDate, setSelDate] = useState(toISO(new Date())); // 달력에서 고른 날
   const [showSaved, setShowSaved] = useState(false);
   const [showBudgetDetail, setShowBudgetDetail] = useState(false);
   const [goalEdit, setGoalEdit] = useState(null); // null 이면 보기 상태
@@ -1134,10 +1138,54 @@ export default function MoneyBoard() {
     setPMonth(""); setPAmt(""); setPMemo("");
   };
 
-  /* 가계부 — 지난 기록은 날짜별로, 아직 오지 않은 기록은 '예정'으로 분리 */
-  const pastEntries = data.entries.filter(isPast);
+  /* 가계부 — 아직 오지 않은 기록은 '예정'으로 따로 셈한다 */
   const futureEntries = data.entries.filter((e) => !isPast(e)).sort((a, b) => a.date.localeCompare(b.date));
-  const pastDates = [...new Set(pastEntries.map((e) => e.date))].sort().reverse().slice(0, 40);
+
+  /* 달력 — 한 달을 주 단위로 채운다. 날짜별 합계는 미리 한 번만 모은다 */
+  const calBase = new Date(nowD.getFullYear(), nowD.getMonth() + calShift, 1);
+  const calY = calBase.getFullYear(), calM = calBase.getMonth();
+  const dayAgg = (() => {
+    const m = new Map();
+    for (const e of data.entries) {
+      const a = m.get(e.date) ?? { expense: 0, income: 0, move: 0 };
+      if (e.type === "expense") a.expense += e.amount;
+      else if (e.type === "income") a.income += e.amount;
+      else a.move += e.amount;
+      m.set(e.date, a);
+    }
+    return m;
+  })();
+  const calWeeks = (() => {
+    const lastDay = new Date(calY, calM + 1, 0).getDate();
+    const start = startOfWeek(calBase, data.weekStart);
+    const end = startOfWeek(new Date(calY, calM, lastDay), data.weekStart);
+    const weeks = [];
+    for (let w = new Date(start); w <= end; w.setDate(w.getDate() + 7)) {
+      const row = [];
+      for (let i = 0; i < 7; i++) {
+        const d = addDays(w, i);
+        const iso = toISO(d);
+        const agg = dayAgg.get(iso) ?? { expense: 0, income: 0, move: 0 };
+        // 예산은 지난 날에만 뜻이 있다 — 아직 오지 않은 날엔 비교할 게 없다
+        const budget = iso <= todayISO && spendAccs.length > 0
+          ? perDayFrom(Math.max(0, spendBalanceOn(iso) - goalFor(spendBalanceOn(iso))), daysToPayFrom(iso))
+          : null;
+        row.push({
+          iso, day: d.getDate(), inMonth: d.getMonth() === calM, isToday: iso === todayISO,
+          ...agg, over: budget != null && budget > 0 && spentOn(iso) > budget,
+        });
+      }
+      weeks.push(row);
+    }
+    return weeks;
+  })();
+  const calMonthSpent = data.entries
+    .filter((e) => e.type === "expense" && fromISO(e.date).getMonth() === calM && fromISO(e.date).getFullYear() === calY)
+    .reduce((s, e) => s + e.amount, 0);
+  const selList = data.entries.filter((e) => e.date === selDate);
+  const selSpent = selList.filter((e) => e.type === "expense").reduce((s, e) => s + e.amount, 0);
+  const wdHeads = Array.from({ length: 7 }, (_, i) => WD[(data.weekStart + i) % 7]);
+
   const acctLine = (e) =>
     e.type === "income" ? acctName(e.to) : e.type === "transfer" ? `${acctName(e.from)} → ${acctName(e.to)}` : acctName(e.from);
 
@@ -1334,8 +1382,14 @@ export default function MoneyBoard() {
             <div className="text-[13px] mt-1" style={{ color: C.sub }}>
               쓸돈 {fmt(spendBal)} · 급여일까지 {pay.days}일 · 하루 {fmt(todayBudget)}
             </div>
+            {/* 쓸돈은 여러 계좌를 더한 값이다 — 한 계좌만 고치고 안 맞는다고 볼 수 있어 풀어 적는다 */}
+            {spendAccs.length > 1 && (
+              <div className="text-[13px]" style={{ color: C.sub }}>
+                쓸돈 = {spendAccs.map((a) => `${a.name} ${fmt(bal(a))}`).join(" + ")}
+              </div>
+            )}
             <div className="text-[13px]" style={{ color: C.sub }}>
-              이번 주 ≈ {fmt(weekEstimate)}
+              이번 주 ≈ {fmt(weekEstimate)} · 지금까지 {fmt(weekSpent)}
               {saveGoal > 0 && ` · 목표 ${fmt(saveGoal)} ${paceDiff >= 0 ? `${fmt(paceDiff)} 앞서는 중` : `${fmt(-paceDiff)} 뒤처짐`}`}
             </div>
 
@@ -2030,28 +2084,67 @@ export default function MoneyBoard() {
 
         {/* 가계부 */}
         <Card title="가계부">
+          {/* 달 이동 */}
           <Row first>
-            <span className="text-[13px] flex-1" style={{ color: C.sub }}>이번 주</span>
-            <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>{fmt(weekSpent)}</span>
+            <button onClick={() => setCalShift(calShift - 1)} className="text-[17px] px-2 -ml-2" style={{ color: C.accent }}>‹</button>
+            <button onClick={() => setCalShift(0)} className="text-[15px] flex-1 text-center">
+              {calY}년 {calM + 1}월
+              {calShift !== 0 && <span className="text-[13px]" style={{ color: C.accent }}> · 오늘로</span>}
+            </button>
+            <span className="text-[13px] tabular-nums" style={{ color: C.sub }}>{fmt(calMonthSpent)}</span>
+            <button onClick={() => setCalShift(calShift + 1)} className="text-[17px] px-2 -mr-2" style={{ color: C.accent }}>›</button>
           </Row>
-          {pastDates.length === 0 && futureEntries.length === 0 && (
-            <Row><span className="text-[15px]" style={{ color: C.sub }}>아직 기록이 없어요.</span></Row>
-          )}
-          {pastDates.map((dt, di) => {
-            const list = pastEntries.filter((e) => e.date === dt);
-            const dSum = list.filter((e) => e.type === "expense").reduce((s, e) => s + e.amount, 0);
-            // 주가 바뀌는 자리에만 얇은 선을 둔다
-            const newWeek = di > 0 && toISO(sow(fromISO(dt))) !== toISO(sow(fromISO(pastDates[di - 1])));
-            return (
-              <div key={dt} style={newWeek ? { borderTop: `1px solid ${C.line}`, marginTop: 10 } : undefined}>
-                <div className="pt-3 pb-1 flex justify-between text-[13px]" style={{ color: C.sub }}>
-                  <span>{dayLabel(dt)}</span>
-                  <span className="tabular-nums">{fmt(dSum)}</span>
-                </div>
-                {list.map((e, i) => renderEntry(e, i === 0))}
+
+          {/* 달력 — 숫자는 그날 지출, 초록 점은 수입이 있던 날 */}
+          <div className="pt-2 pb-3">
+            <div className="grid grid-cols-7">
+              {wdHeads.map((w) => (
+                <div key={w} className="text-[11px] text-center pb-1" style={{ color: C.sub }}>{w}</div>
+              ))}
+            </div>
+            {calWeeks.map((week, wi) => (
+              <div key={wi} className="grid grid-cols-7 gap-1 mb-1">
+                {week.map((c) => {
+                  const on = c.iso === selDate;
+                  return (
+                    <button key={c.iso} onClick={() => setSelDate(c.iso)}
+                      className="rounded-[10px] py-1.5 flex flex-col items-center justify-start gap-[1px] min-h-[46px]"
+                      style={{
+                        background: on ? C.accent : c.isToday ? C.fill : "transparent",
+                        opacity: c.inMonth ? 1 : 0.3,
+                      }}>
+                      <span className="text-[12px] tabular-nums leading-none"
+                        style={{ color: on ? "#fff" : c.isToday ? C.text : C.sub }}>
+                        {c.day}
+                      </span>
+                      {c.expense > 0 && (
+                        <span className="text-[10px] tabular-nums leading-none"
+                          style={{ color: on ? "#fff" : c.over ? C.danger : C.text }}>
+                          {fmtCell(c.expense)}
+                        </span>
+                      )}
+                      {c.income > 0 && (
+                        <span className="w-[5px] h-[5px] rounded-full mt-[1px]"
+                          style={{ background: on ? "#fff" : C.accent }} />
+                      )}
+                    </button>
+                  );
+                })}
               </div>
-            );
-          })}
+            ))}
+          </div>
+
+          {/* 고른 날 */}
+          <div className="pt-1 pb-1 flex items-center gap-2 text-[13px]" style={{ borderTop: `1px solid ${C.line}`, color: C.sub }}>
+            <span className="flex-1">{dayLabel(selDate)}</span>
+            {selDate !== eDate && (
+              <button onClick={() => setEDate(selDate)} style={{ color: C.accent }}>이 날짜로 적기</button>
+            )}
+            <span className="tabular-nums">{fmt(selSpent)}</span>
+          </div>
+          {selList.length === 0
+            ? <Row><span className="text-[15px]" style={{ color: C.sub }}>이 날은 기록이 없어요.</span></Row>
+            : selList.map((e, i) => renderEntry(e, i === 0))}
           {futureEntries.length > 0 && (
             <>
               <Row onClick={() => setShowFuture(!showFuture)}>
