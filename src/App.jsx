@@ -88,6 +88,18 @@ const toLocalInput = (ts) => {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 };
 
+/* 서버가 돌려준 실패 사유를 사람이 읽을 수 있게 — 사유를 감추면 고칠 수가 없다.
+   자주 나오는 것은 뜻을 풀어 준다 */
+const errText = (err) => {
+  const code = err?.code ?? "";
+  const msg = err?.message ?? String(err ?? "");
+  if (code === "23514" && /role/.test(msg))
+    return "서버가 '페이' 역할을 아직 모릅니다 — accounts.role 제약에 'pay' 를 넣어야 해요";
+  if (code === "42501") return "권한 없음 — 로그아웃 후 다시 로그인해 보세요";
+  if (code === "PGRST204" || code === "42703") return `서버에 없는 칸이에요 — ${msg}`;
+  return [code, msg].filter(Boolean).join(" · ").slice(0, 200);
+};
+
 /* 계좌 잔액이 어느 시점부터의 기록을 반영하는지 — 기준이 없다시피 하면 '모든 기록' */
 const baseLabel = (ts) => {
   if (!Number.isFinite(ts) || ts < Date.parse("2020-01-01")) return "전체 기록 기준";
@@ -443,6 +455,7 @@ export default function MoneyBoard() {
   const [session, setSession] = useState(undefined); // undefined=확인 전, null=로그아웃
   const [authError, setAuthError] = useState("");
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
+  const [syncError, setSyncError] = useState(""); // 서버가 돌려준 실패 사유 — 삼키면 고칠 수가 없다
   const [askUpload, setAskUpload] = useState(false);
   const [updateReady, setUpdateReady] = useState(false);
   const pushTimer = useRef(null);
@@ -505,8 +518,10 @@ export default function MoneyBoard() {
         saveSnap(merged); // 받아온 상태는 이미 서버와 같으므로 되올리지 않는다
         setData(merged);
         setSyncState("idle");
-      } catch {
+        setSyncError("");
+      } catch (err) {
         setSyncState(navigator.onLine ? "error" : "offline");
+        setSyncError(errText(err));
       }
     })();
   }, [session, data]);
@@ -522,8 +537,10 @@ export default function MoneyBoard() {
       try {
         await push(session.user.id, data);
         setSyncState("idle");
-      } catch {
+        setSyncError("");
+      } catch (err) {
         setSyncState(navigator.onLine ? "error" : "offline");
+        setSyncError(errText(err));
       }
     }, 1200);
     return () => clearTimeout(pushTimer.current);
@@ -1195,14 +1212,17 @@ export default function MoneyBoard() {
         <header className="flex items-start justify-between px-1">
           <div>
             <h1 className="text-[28px] font-semibold tracking-tight leading-tight">{data.appName}</h1>
-            <div className="text-[13px] mt-0.5" style={{ color: C.sub }}>
+            <div className="text-[13px] mt-0.5" style={{ color: syncState === "error" ? C.danger : C.sub }}>
               {serverEnabled
                 ? syncState === "syncing" ? "전송 중…"
                 : syncState === "offline" ? "오프라인 — 나중에 전송"
-                : syncState === "error" ? "전송 실패 — 다시 시도해요"
+                : syncState === "error" ? "전송 실패"
                 : "동기화됨"
                 : "쓴 날 바로 적기"}
             </div>
+            {syncState === "error" && syncError && (
+              <div className="text-[13px] mt-0.5 max-w-[240px]" style={{ color: C.sub }}>{syncError}</div>
+            )}
           </div>
           {editPay ? (
             <input
