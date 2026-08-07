@@ -865,16 +865,25 @@ export default function MoneyBoard() {
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, 30);
 
-  /* 모이는 돈 — 올해 12월 말까지 */
+  /* 모이는 돈 — 올해 12월 말까지.
+     전체 자산은 계좌 카드의 '전체'와 같은 값에서 출발한다.
+     월 적립은 계좌 사이를 옮기는 돈이라 전체 자산을 늘리지 않는다 —
+     투자 원금만 늘린다. 전체를 늘리는 건 예정 수입뿐이다 */
   const curY = nowD.getFullYear(), curM = nowD.getMonth();
   const monthsToDec = 12 - curM;
+  const assetsNow = cashTotal + investTotal + pensionTotal;
   const plannedUpTo = (m) => data.planned.filter((p) => p.month <= m).reduce((s, p) => s + p.amount, 0);
   const goalRows = Array.from({ length: monthsToDec }, (_, i) => {
     const m = curM + 1 + i;
-    return { key: m, label: `${m}월`, total: investTotal + data.goal.monthly * (i + 1) + plannedUpTo(m) };
+    return {
+      key: m, label: `${m}월`,
+      assets: assetsNow + plannedUpTo(m),
+      invest: investTotal + data.goal.monthly * (i + 1),
+    };
   });
   const plannedTotal = data.planned.reduce((s, p) => s + p.amount, 0);
-  const goalTotal = investTotal + data.goal.monthly * monthsToDec + plannedUpTo(12);
+  const assetsDec = assetsNow + plannedUpTo(12);
+  const investDec = investTotal + data.goal.monthly * monthsToDec;
 
   /* 고정 항목별 상태 — 다음 실행일 / 마지막 반영일 / 밀린 건수 */
   const ruleInfo = (r) => {
@@ -2062,11 +2071,12 @@ export default function MoneyBoard() {
         {/* 모이는 돈 */}
         <Card title="모이는 돈">
           <div className="pt-3 pb-1">
-            <div className="text-[13px]" style={{ color: C.sub }}>{curY}년 12월 말 예상 투자 원금</div>
-            <div className="text-[28px] leading-none font-semibold tabular-nums tracking-tight mt-1">{fmt(goalTotal)}</div>
-            <div className="text-[13px] mt-2" style={{ color: C.sub }}>
-              지금 {fmt(investTotal)} + 월 {fmt(data.goal.monthly)} × {monthsToDec}개월
-              {plannedTotal > 0 && ` + 예정 ${fmt(plannedTotal)}`}
+            <div className="text-[13px]" style={{ color: C.sub }}>{curY}년 12월 말 예상 전체 자산</div>
+            <div className="text-[28px] leading-none font-semibold tabular-nums tracking-tight mt-1">{fmt(assetsDec)}</div>
+            <div className="text-[13px] mt-2 leading-relaxed" style={{ color: C.sub }}>
+              지금 {fmt(assetsNow)}
+              {plannedTotal > 0 && ` + 예정 수입 ${fmt(plannedUpTo(12))}`}
+              <br />계좌 '전체'와 같은 값이에요 · 앞으로 쓸 돈은 빼지 않았어요
             </div>
           </div>
           <Row>
@@ -2074,10 +2084,23 @@ export default function MoneyBoard() {
             <Amount value={data.goal.monthly} className="text-[15px]"
               onCommit={(n) => up((d) => { d.goal.monthly = n; return d; })} />
           </Row>
+          <Row>
+            <span className="text-[13px] flex-1 leading-relaxed" style={{ color: C.sub }}>
+              12월 말 투자 원금 <span className="tabular-nums" style={{ color: C.text }}>{fmt(investDec)}</span>
+              {` — 지금 ${fmt(investTotal)} + 월 ${fmt(data.goal.monthly)} × ${monthsToDec}개월`}
+              <br />적립은 계좌 사이 이동이라 전체 자산은 늘지 않아요
+            </span>
+          </Row>
+          <Row>
+            <span className="text-[13px] flex-1" style={{ color: C.sub }}>월</span>
+            <span className="text-[13px] w-24 text-right" style={{ color: C.sub }}>전체 자산</span>
+            <span className="text-[13px] w-20 text-right" style={{ color: C.sub }}>투자</span>
+          </Row>
           {goalRows.map((r) => (
             <Row key={r.key}>
               <span className="text-[15px] flex-1" style={{ color: C.sub }}>{r.label}</span>
-              <span className="text-[15px] tabular-nums">{fmt(r.total)}</span>
+              <span className="text-[15px] w-24 text-right tabular-nums">{fmt(r.assets)}</span>
+              <span className="text-[15px] w-20 text-right tabular-nums" style={{ color: C.sub }}>{fmt(r.invest)}</span>
             </Row>
           ))}
           <Row>
